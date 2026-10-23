@@ -51,6 +51,7 @@ def parser():
     sub.add_parser('tree', parents=[c], help='assemble the build tree')
     b = sub.add_parser('build', parents=[c], help='build kernel, package and firmware')
     b.add_argument('steps', nargs='*', choices=STEPS + OPTIONAL_STEPS + ('all', 'prelink'), default=['all'])
+    b.add_argument('--root-policy', action='append', metavar='NAME=FILE', help='userdata: place the owner-signed VerifiedRoot manifest FILE for window NAME in the image (repeatable)')
     i = sub.add_parser('bootimg', parents=[c], help='pack the boot image from the firmware volume and a device tree')
     i.add_argument('--fd', metavar='FILE', help='firmware volume (default: the build output under --uefi)')
     i.add_argument('--dtb', metavar='FILE', help='compiled device tree; or UNIXNU_DTB')
@@ -116,7 +117,7 @@ def cmd_build(ctx):
     if 'all' in steps:
         steps = list(STEPS)
     if 'userdata' in steps:
-        userdata.build(ctx, ctx.args.dry_run)
+        userdata.build(ctx, ctx.args.dry_run, ctx.args.root_policy)
         steps = [step for step in steps if step != 'userdata']
         if not steps:
             return

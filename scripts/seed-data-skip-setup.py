@@ -2,7 +2,7 @@
 """Make a Data seed that boots to SpringBoard instead of Setup: the preference changes github.com/dipa-studio/ios-sweet
 (tools/sweet-root-tweaks.py) established on hardware, applied to a copy of an existing packed Data seed.
 
-  seed-data-skip-setup.py BASE.dbr OUTPUT.dbr [--no-auto-dim]
+  seed-data-skip-setup.py BASE.dbr OUTPUT.dbr [--no-auto-dim] [--plain-framebuffer]
 
 BASE is a DBRDISK1 packed APFS container (drivers/DarwinBoot/Test/packed_ramdisk.py format). It is expanded to a raw image, attached
 read-write on this Mac, the preference files below are merged into /private/var/mobile/Library/Preferences, and the result is packed
@@ -16,6 +16,10 @@ and the container directories under /private/var/containers that on a device liv
 --no-auto-dim also sets com.apple.springboard SBDisableAutoDim, SBDontDimOrLockOnAC and SBDisableIdleSleep (as UniXNU-qemu's
 build-os-root.py does): a board without input would otherwise turn its display off about 30 seconds after SpringBoard starts
 and put the system to sleep.
+--plain-framebuffer sets CAEnableDeepFramebuffer, CAEnableFramebufferCompression and CAEnableIOSurfaceCompression to false in
+backboardd and the global domain, for mobile and root, as add-gpu-plugin-data.py --publish does for a GPU addon delivered in the
+seed: the render server otherwise picks a 10-bit deep, compressed framebuffer when it starts, before the Metal plugin can say
+otherwise. Needed with a GPU addon that the payload carries (make-gpu-addon.py), which leaves the seed unchanged.
 """
 import hashlib, json, os, plistlib, subprocess, sys, tempfile
 from pathlib import Path
@@ -36,9 +40,24 @@ def merge_pref(var, name, values):
     os.chmod(path, 0o600)
     print('pref', name, sorted(values))
 
+def plain_framebuffer(var):
+    """The render server's framebuffer preferences, read at its start, for the process's user and root, in its own domain and the
+    global one its lookup falls back to (add-gpu-plugin-data.py --publish)."""
+    for home in ('mobile', 'root'):
+        for name in ('backboardd', '.GlobalPreferences'):
+            path = var / home / 'Library/Preferences' / (name + '.plist')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = plistlib.loads(path.read_bytes()) if path.exists() else {}
+            data.update({'CAEnableDeepFramebuffer': False, 'CAEnableFramebufferCompression': False,
+                         'CAEnableIOSurfaceCompression': False})
+            path.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_BINARY))
+            os.chmod(path, 0o644)
+            print('pref', home, name, 'plain framebuffer')
+
 def main():
     no_auto_dim = '--no-auto-dim' in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg != '--no-auto-dim']
+    plain = '--plain-framebuffer' in sys.argv[1:]
+    positional = [arg for arg in sys.argv[1:] if arg not in ('--no-auto-dim', '--plain-framebuffer')]
     if len(positional) != 2:
         sys.exit(__doc__)
     base, output = Path(positional[0]).resolve(), Path(positional[1]).resolve()
@@ -78,6 +97,8 @@ def main():
                                    'SilentICDPUpgrade')})
             merge_pref(mount, 'com.apple.managedconfiguration.notbackedup', {
                 'LockdownActivationIndicatesCloudConfigurationAvailable': False})
+            if plain:
+                plain_framebuffer(mount)
             for sub in ('Bundle', 'Data/System', 'Shared/SystemGroup', 'Temp'):
                 d = mount / 'containers' / sub
                 if not d.is_dir():
@@ -92,7 +113,8 @@ def main():
     report = dict(base_sha256=packed_ramdisk.inspect(base)[0]['sha256'], output=metadata,
                   preferences=['com.apple.migration', 'com.apple.springboard', 'com.apple.purplebuddy',
                                'com.apple.purplebuddy.notbackedup', 'com.apple.managedconfiguration.notbackedup'],
-                  no_auto_dim=no_auto_dim, build=BUILD, source='github.com/dipa-studio/ios-sweet tools/sweet-root-tweaks.py')
+                  no_auto_dim=no_auto_dim, plain_framebuffer=plain, build=BUILD,
+                  source='github.com/dipa-studio/ios-sweet tools/sweet-root-tweaks.py')
     output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

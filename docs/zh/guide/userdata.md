@@ -35,14 +35,16 @@ windows = [
 
 `first_lba` 和 `last_lba` 来自设备上名为 `userdata` 的 GPT 条目，`lba_bytes` 是分区逻辑块大小。
 
-镜像大小为各窗口按 1 MiB 对齐后的总和，加上 1 MiB 头部区域。步骤拒绝超过分区容量的镜像。
+镜像大小为各窗口按 1 MiB 对齐后的总和，加上 1 MiB 头部区域；使用 `--root-policy` 时还要加上策略清单。步骤拒绝超过分区容量的镜像。
 
 ## 布局
 
 ```
 0x000000  SHNGROOT manifest，4096 字节，零填充到 1 MiB
+0x001000  SHNGPOL1 策略目录，4096 字节（仅使用 --root-policy 时）
 0x100000  OS 窗口，完整磁盘镜像
 ....      SystemOS 窗口，完整磁盘镜像
+....      所有者签名的 VerifiedRoot 清单，按 4 KiB 对齐
 ```
 
 manifest 为小端：
@@ -57,6 +59,32 @@ manifest 为小端：
 | 4064 | 字节 0 到 4063 的 SHA-256 |
 
 每个窗口条目包含 32 字节名称、64 位偏移、64 位大小、32 位块大小、32 位标志、32 字节 SHA-256 和 40 字节保留。
+
+## VerifiedRoot 策略
+
+`--root-policy NAME=FILE` 把所有者签名的 VerifiedRoot 清单放进镜像，并在策略目录里记下位置。这样内核只需携带 395 字节的所有者公钥，不必链接 70 MB 的逐块哈希表，内核因此能放进 96 MiB 的 boot 分区：
+
+```sh
+./unixnu build userdata \
+  --root-policy OS=build/verified-root-os/manifest.bin \
+  --root-policy SystemOS=build/verified-root-systemos/manifest.bin
+```
+
+如果清单签名里的镜像大小与窗口大小不符，步骤会拒绝。内核从第 2 个块读取目录，按窗口名选择清单，用内置公钥验证签名；签名和逐块哈希都通过之前不会提供任何块。
+
+目录只是定位信息，不是信任输入：
+
+| 偏移 | 字段 |
+| --- | --- |
+| 0 | `SHNGPOL1` |
+| 8 | 版本，32 位，值 1 |
+| 12 | 清单数，32 位 |
+| 16 | 条目大小，32 位，值 88 |
+| 24 | 条目：32 字节名称、64 位偏移、64 位大小、32 位块大小（4096）、32 位标志（1）、32 字节 SHA-256 |
+| 4064 | 字节 0 到 4063 的 SHA-256 |
+
+不带 `--root-policy` 的镜像没有目录块；内核会报告 `no policy bundle`，verified 路径不发布任何设备。
+
 
 ## 刷写
 

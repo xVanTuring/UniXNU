@@ -4,12 +4,20 @@ It holds the unchanged OS and SystemOS disk images of the IPSW, byte for byte, b
 (the SHNGROOT layout the native UFS root driver reads):
 
     0x000000  manifest block (4096 bytes), zero padding to 1 MiB
+    0x001000  root policy directory (4096 bytes, SHNGPOL1; only with --root-policy)
     0x100000  window "OS"        the whole attached OS disk image, 1 MiB aligned
     ....      window "SystemOS"  the whole attached SystemOS disk image, 1 MiB aligned
+    ....      policy manifests  owner-signed VerifiedRoot envelopes, 4 KiB aligned
 
 Manifest (little endian): "SHNGROOT", u32 version=1, u32 count, u64 image_bytes, then `count` 128-byte entries
 {char name[32], u64 offset, u64 size, u32 block_size=512, u32 flags(1=read-only), u8 sha256[32], 40 reserved},
 and at byte 4064 the SHA-256 of bytes 0..4063.
+
+The policy directory lets the kernel keep the 395-byte owner key instead of linking the manifests: it names the
+window each envelope belongs to, and the envelope itself is authenticated by that key before any block is served.
+"SHNGPOL1", u32 version=1, u32 count, u32 entry_bytes=88, u32 reserved, `count` entries
+{char name[32], u64 offset, u64 size, u32 block_bytes=4096, u32 flags(1=read-only), u8 sha256[32]}, and at byte
+4064 the SHA-256 of bytes 0..4063. It is a locator, not a trust input: the signed envelope decides.
 
 The images come from the IPSW (a local file or a remote URL, see ipsw.py) and are checked against the pins of
 board.toml. The disk images are attached read-only without mounting (macOS hdiutil). Nothing is flashed: the
@@ -17,6 +25,7 @@ report prints the fastboot command, to be run by the user.
 """
 import hashlib
 import json
+from pathlib import Path
 import plistlib
 import re
 import struct
@@ -27,6 +36,43 @@ from .util import Error, log, run, sha256_file, tool
 
 MIB = 1 << 20
 CHUNK = 8 * MIB
+POLICY_ENTRY = 88
+
+
+def parse_policy_options(values):
+    """--root-policy NAME=FILE, one per window; repeated names are refused."""
+    result = {}
+    for value in values or []:
+        name, separator, path = value.partition('=')
+        if not separator or not name or not path:
+            raise Error(f'--root-policy {value}: expected NAME=FILE')
+        if name in result:
+            raise Error(f'--root-policy {name}: given twice')
+        result[name] = Path(path)
+    return result
+
+
+def policy_manifest(name, path, window_bytes):
+    """Read and sanity check an owner-signed envelope for one window (the key check happens in the kernel)."""
+    manifest = path.read_bytes()
+    if len(manifest) < 544 or manifest[:8] != b'VROOT01\x00':
+        raise Error(f'--root-policy {name}: {path} is not a VerifiedRoot manifest')
+    header, block = struct.unpack_from('<I', manifest, 12)[0], struct.unpack_from('<I', manifest, 16)[0]
+    image_bytes, count = struct.unpack_from('<Q', manifest, 24)[0], struct.unpack_from('<Q', manifest, 32)[0]
+    if header != 160 or block != 4096 or image_bytes != window_bytes or len(manifest) != 544 + count * 32:
+        raise Error(f'--root-policy {name}: {path} does not describe the {window_bytes}-byte window')
+    return manifest
+
+
+def policy_directory(entries):
+    """The SHNGPOL1 locator block; each entry is {name, offset, size, sha256}."""
+    block = bytearray(4096)
+    block[0:8] = b'SHNGPOL1'
+    struct.pack_into('<IIII', block, 8, 1, len(entries), POLICY_ENTRY, 0)
+    for index, entry in enumerate(entries):
+        struct.pack_into('<32sQQII32s', block, 24 + POLICY_ENTRY * index, entry[0].encode(), entry[1], entry[2], 4096, 1, entry[3])
+    block[4064:4096] = hashlib.sha256(bytes(block[:4064])).digest()
+    return block
 
 
 def paths(ctx):
@@ -50,11 +96,16 @@ def attach(dmg):
     raise Error('could not find the attached disk device')
 
 
-def build(ctx, dry_run=False):
+def build(ctx, dry_run=False, root_policies=None):
     log('userdata payload')
     spec = ctx.board.get('userdata')
     if not spec:
         raise Error('board.toml has no [userdata]')
+    policies = parse_policy_options(root_policies)
+    windows = {window['name'] for window in spec['windows']}
+    for name in policies:
+        if name not in windows:
+            raise Error(f'--root-policy {name}: no such [userdata] window')
     tool('hdiutil', 'the disk images are attached with macOS hdiutil')
     source = Ipsw(ctx)
     capacity = (spec['last_lba'] - spec['first_lba'] + 1) * spec.get('lba_bytes', 4096)
@@ -62,6 +113,8 @@ def build(ctx, dry_run=False):
         for window in spec['windows']:
             name, size, _ = source.info(window['component'])
             log(f'userdata: {window["name"]} would be extracted from {name} ({size >> 20} MiB)')
+        for name, path in policies.items():
+            log(f'userdata: {name} would carry the VerifiedRoot manifest {path}')
         log('userdata: dry run, nothing extracted or written')
         return None
     sources = [(window['name'], source.extract(window['component'])) for window in spec['windows']]
@@ -70,6 +123,14 @@ def build(ctx, dry_run=False):
         size = image_size(dmg)
         layout.append((name, cursor, size))
         cursor += (size + MIB - 1) // MIB * MIB
+    policy_layout = []
+    for name, _, window_bytes in layout:
+        if name not in policies:
+            continue
+        manifest = policy_manifest(name, policies[name], window_bytes)
+        offset = (cursor + 4095) // 4096 * 4096
+        policy_layout.append((name, offset, len(manifest), hashlib.sha256(manifest).digest(), manifest))
+        cursor = offset + (len(manifest) + 4095) // 4096 * 4096
     total = cursor
     log(f'userdata: image {total} bytes ({total / 2**30:.2f} GiB) in a partition of {capacity} bytes')
     if total > capacity:
@@ -101,6 +162,10 @@ def build(ctx, dry_run=False):
                 subprocess.run(['hdiutil', 'detach', device], capture_output=True)
             entries.append((name, offset, size, digest.digest()))
             log(f'userdata: {name} {size} bytes at {offset:#x} sha256 {digest.hexdigest()}')
+        for name, offset, size, digest, manifest in policy_layout:
+            target.seek(offset)
+            target.write(manifest)
+            log(f'userdata: policy {name} {size} bytes at {offset:#x} sha256 {digest.hex()}')
         header = bytearray(4096)
         header[0:8] = b'SHNGROOT'
         struct.pack_into('<IIQ', header, 8, 1, len(entries), total)
@@ -109,8 +174,14 @@ def build(ctx, dry_run=False):
         header[4064:4096] = hashlib.sha256(bytes(header[:4064])).digest()
         target.seek(0)
         target.write(header)
+        directory = policy_directory([(name, offset, size, digest) for name, offset, size, digest, _ in policy_layout]) if policy_layout else None
+        if directory:
+            target.seek(4096)
+            target.write(directory)
     data = {'image_bytes': total, 'image_sha256': sha256_file(image), 'manifest_sha256': hashlib.sha256(bytes(header)).hexdigest(),
             'windows': [{'name': n, 'offset': o, 'size': s, 'sha256': d.hex()} for n, o, s, d in entries],
+            'policies': [{'name': n, 'offset': o, 'size': s, 'sha256': d.hex()} for n, o, s, d, _ in policy_layout],
+            'policy_manifest_sha256': hashlib.sha256(bytes(directory)).hexdigest() if directory else None,
             'userdata_bytes': capacity, 'flash_command': f'fastboot flash userdata {image}',
             'source': 'remote' if source.remote else 'local', 'hardware_tested': False}
     report.write_text(json.dumps(data, indent=2) + '\n')
