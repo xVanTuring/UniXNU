@@ -14,7 +14,7 @@ The ports listed here are independent. Their maintainers own the repositories; t
 | --- | --- | --- | --- |
 | [DroidVM guest (crosvm on Gunyah)](/devices/droidvm) | crosvm-gunyah | iPadOS 17 home screen; CPU presentation; Metal widgets and icons; virtio-net works | Droid-VM |
 | [QEMU virt](/devices/qemu) | QEMU virt | iPadOS 17 home screen and Settings; Metal on the Mac GPU with `--metal` | xVanTuring |
-| [Lenovo Xiaoxin Pad 2022 (tb128fu)](/devices/tb128fu) | SM6225 | iPadOS 17 home screen with touch; Metal frames presented by the GPU; Adreno 610 runs | xVanTuring |
+| [Lenovo Xiaoxin Pad 2022 (tb128fu)](/devices/tb128fu) | SM6225 | iPadOS 17 home screen with touch; Metal frames presented by the GPU; Adreno 610 runs; usability poor (about 25–40 fps) | xVanTuring |
 | [OnePlus 10 Pro 5G (negroni)](/devices/negroni) | SM8450 | iOS 16.7.16 SpringBoard with touch; CPU-rendered; Wi-Fi pending | pawlickerr |
 | [Xiaomi 17 Pro (pandora)](/devices/pandora) | SM8850 | iOS 16.7.16 lock screen with touch and buttons; own loader, no UEFI chain | ShueiTsuki |
 | [Xiaomi 13 (fuxi)](/devices/fuxi) | SM8550 | Kernel links and prelinks; stage B archive chain near complete; no hardware run | matejkoo217, hanzi123-bilp |

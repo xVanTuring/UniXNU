@@ -14,7 +14,8 @@ tb128fu 是搭载骁龙 680（SM6225）的联想小新 Pad 2022（TB128FU）。�
 | UEFI 固件和 UniXNU 菜单 | 工作。纯 Mu：原厂 ABL 没有可拆出的厂商 DXE 模块；显示使用 ABL 留下的启动画面缓冲区 |
 | 负载卷和 DarwinBoot | 工作。镜像刷入 `boot_a`；ABL 的 `fastboot boot` 缓冲区放不下它 |
 | XNU 和根文件系统 | iPadOS 17.7.11 内核运行在全部 8 个核上；UFS 上的已验证 OS/SystemOS 根和 Data 卷 |
-| iOS 用户态 | 开机后 70～95 秒出现主屏幕；QuartzCore 在 CPU 上绘制，Metal 帧通过 GPU 交接呈现 |
+| iOS 用户态 | 开机后 70～95 秒出现主屏幕；渲染服务用 Metal 在 Adreno 610 上合成，帧通过 GPU 交接呈现 |
+| 可用性 | iPadOS 17 可用性差。主屏幕翻页约 25～40 帧（最低 13 帧）：CoreAnimation 的每个图层都用帧缓冲读取做混合，Adreno 610 上每次绘制都要为此付出代价；渲染服务每帧还要约 27 ms 的 CPU 时间 |
 | 触控 | SPI 上的 Himax HX83102E；内核下载其固件 |
 | GPU | Adreno 610（无 GMU）在 NativeAdreno 下运行；Metal 插件通过 GPU 交接呈现帧，tb128fu-040 中 236 帧全部走 GPU，无 CPU 回退 |
 | 未工作 | 音频、Wi-Fi、电池、按键、休眠 |
