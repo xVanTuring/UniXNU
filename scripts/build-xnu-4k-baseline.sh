@@ -64,8 +64,10 @@ if [ "$BOOT_PROGRESS" != 0 ] && [ "$BOOT_PROGRESS" != 1 ]; then
   exit 1
 fi
 if [ "$BOOT_PROGRESS" = 1 ]; then
-  if [ "${XNU_NATIVE_UFS:-0}" != 1 ] || [ "${XNU_OWNER_ROOT_AUDIT:-0}" != 1 ] || \
-     [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" != 1 ] || [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; then
+  # A board whose hooks need none of the progress page's inputs (XNU_BOOT_PROGRESS_STANDALONE: pipa's ramoops kernel log) skips
+  # the audit requirement; its scripts/build-boot-progress.py builds build/boot-progress/libBootProgress.a all the same.
+  if [ "${XNU_BOOT_PROGRESS_STANDALONE:-0}" != 1 ] && { [ "${XNU_NATIVE_UFS:-0}" != 1 ] || [ "${XNU_OWNER_ROOT_AUDIT:-0}" != 1 ] || \
+     [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" != 1 ] || [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; }; then
     echo 'Boot progress requires the audited UFS/owner-root, Virtio and source-corecrypto build' >&2
     exit 1
   fi
