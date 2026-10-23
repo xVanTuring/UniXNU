@@ -22,11 +22,13 @@ parser.add_argument('--manifest-only', action='store_true',
 args = parser.parse_args()
 if subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip() != PIN:
     raise SystemExit('Translator revision differs from the qualified source pin')
-PATCHES = [ROOT / 'drivers/NativeMetal/bridge/patches' / name for name in [
-    '0001-optional-constant-output-members.patch', '0002-resource-wait-storage-dependencies.patch',
-    '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
-    '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
-    '0007-accept-two-plane-rgb-surfaces.patch']]
+PATCH_DIR = ROOT / 'drivers/NativeMetal/bridge/patches'
+QUALIFIED = ['0001-optional-constant-output-members.patch', '0002-resource-wait-storage-dependencies.patch',
+             '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
+             '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
+             '0007-accept-two-plane-rgb-surfaces.patch']
+# A module's own patches beyond the qualified ones (a device fork of NativeMetal carries them) follow in name order.
+PATCHES = [PATCH_DIR / name for name in QUALIFIED] + sorted(p for p in PATCH_DIR.glob('*.patch') if p.name not in QUALIFIED)
 tree_diff = subprocess.check_output(['git', '-C', str(SOURCE), 'diff', 'HEAD', '--'], text=True)
 def canonical_diff(diff):
     # Independent patches touch disjoint files; Git orders the combined diff by
@@ -69,7 +71,10 @@ manifest.write_text('\n'.join([
     # The runtime hashes every shader-cache key and entry; without asm, sha2 0.10 on aarch64 is the portable software rounds, not the
     # ARMv8 SHA-256 instructions every target CPU has (cpufeatures answers sha2 true on Apple platforms).
     'sha2 = { version = "0.10", features = ["asm"] }',
-    '[profile.release]', 'panic = "unwind"', 'debug = 1', '',
+    '[profile.release]', 'panic = "unwind"', 'debug = 1',
+    # NMB_FAT_LTO=1: one code generation unit across the translator's crates, so the runtime's draw path can inline what it calls in
+    # the compiler crates (a CPU-bound compositor on a slow core; a much longer build).
+    *(['lto = "fat"', 'codegen-units = 1'] if os.environ.get('NMB_FAT_LTO') == '1' else []), '',
 ]))
 if args.manifest_only:
     print(manifest)
