@@ -35,14 +35,16 @@ windows = [
 
 `first_lba` and `last_lba` come from the GPT entry named `userdata` on the device. `lba_bytes` is the logical block size of the partition.
 
-The image size is the sum of the windows, each aligned to 1 MiB, plus the 1 MiB header region. The step rejects an image larger than the partition.
+The image size is the sum of the windows, each aligned to 1 MiB, plus the 1 MiB header region and, with `--root-policy`, the policy envelopes. The step rejects an image larger than the partition.
 
 ## Layout
 
 ```
 0x000000  SHNGROOT manifest, 4096 bytes, zero padded to 1 MiB
+0x001000  SHNGPOL1 policy directory, 4096 bytes (only with --root-policy)
 0x100000  OS window, whole disk image
 ....      SystemOS window, whole disk image
+....      owner-signed VerifiedRoot envelopes, 4 KiB aligned
 ```
 
 The manifest is little endian:
@@ -57,6 +59,32 @@ The manifest is little endian:
 | 4064 | SHA-256 of bytes 0 to 4063 |
 
 Each window entry contains a 32-byte name, a 64-bit offset, a 64-bit size, a 32-bit block size, a 32-bit flags field, a 32-byte SHA-256 and 40 reserved bytes.
+
+## Verified root policies
+
+`--root-policy NAME=FILE` puts an owner-signed VerifiedRoot envelope into the image and records its location in the policy directory. The kernel then carries only the 395-byte owner key instead of the 70 MB of per-block hashes, which keeps the kernel inside a 96 MiB boot partition:
+
+```sh
+./unixnu build userdata \
+  --root-policy OS=build/verified-root-os/manifest.bin \
+  --root-policy SystemOS=build/verified-root-systemos/manifest.bin
+```
+
+The option refuses an envelope whose signed image size is not the window size. The kernel reads the directory from the second block, selects the envelope by window name, authenticates it with the compiled-in key and serves no block until the signature and the per-block hashes match.
+
+The directory is a locator, not a trust input:
+
+| Offset | Field |
+| --- | --- |
+| 0 | `SHNGPOL1` |
+| 8 | version, 32-bit, value 1 |
+| 12 | envelope count, 32-bit |
+| 16 | entry size, 32-bit, value 88 |
+| 24 | entries: 32-byte name, 64-bit offset, 64-bit size, 32-bit block size (4096), 32-bit flags (1), 32-byte SHA-256 |
+| 4064 | SHA-256 of bytes 0 to 4063 |
+
+An image without `--root-policy` has no directory block; the kernel then reports `no policy bundle` and publishes nothing on the verified path.
+
 
 ## Flash
 
