@@ -533,3 +533,39 @@ mdss: CTL0 layer 01000005 01000028 flush 00000000 intf 00000006 pipe 00000000
 所以一个字节日志都没有、屏上只剩蓝色 stage-1 条。**跟基址在 32 GiB 无关**，同样大小的窗口放在 4 GiB
 基址也一样会死；现有 5.75 GiB 配置只剩 2 页余量。要拿到第三段的 8 GiB：先把池子从 16 页加到 34 页
 （零风险），再试"单一区间 7.75 GiB"（+2 GiB），最后做"多段不连续"（内核留在 4 GiB bank，+8 GiB）。
+
+## 12. USB 设备模式：让 macOS 把平板当成一台 iPad（2026-10-25，只读调研）
+
+见 **[HANDOFF-pipa-usb.md](HANDOFF-pipa-usb.md)**。几条要点：
+
+- **整条路能省力，是因为 Apple 的 `AppleUSBXDCI` 本身就是一颗 DWC3 设备控制器驱动**（TRB + `DEPCMD`
+  + `param0..2` + `DCTL/DSTS` + `GSNPSID` + 每 interrupter 一个事件环），而 SM8250 的 `dwc3@a600000`
+  是同一套 Synopsys IP。所以推荐的做法是写一个 `AppleUSBXDCI` 的子类，只补高通侧的时钟/GDSC/PHY/
+  复位/SMMU 和中断桥接，上层（`IOUSBDeviceController` → 配置描述符 → `IOUSBDeviceInterface` →
+  `AppleUSBDeviceMux`）全部现成。
+- **注意 `[kernel.prelink].roots`（board.toml:78-110）里现在一个 USB kext 都没有**，构建出来的内核里
+  没有 `IOUSBDeviceFamily` / `AppleUSBXDCI` / `AppleUSBDeviceMux`，必须加。真机 iPad7,1 的
+  `usb-device` 节点（VID `0x05ac` / PID `0x12ab` / "Apple Inc." / "iPad" / `configuration-string`）
+  已经从 IPSW 的 DeviceTree 里读出来了，照抄即可。
+- **用户态不用写**：`/usr/libexec/lockdownd` 与 `/usr/libexec/afcd` 都在镜像里，`lockdownd` 是
+  `RunAtLoad`（开机就起）；iOS 13+ **没有**设备侧 `usbmuxd`，那是 `lockdownd` 自己的事。配对
+  （"要信任这台电脑吗"）是 AFC 的硬前置。
+- **最硬的约束是 DMA 地址**：我们的内核可用物理内存全在 4 GiB 以上（见 §10.13），而 dwc3 的 TRB 地址
+  宽度未知；高通自己的解法就是 IOMMU 的 `qcom,iommu-dma-addr-pool = 0x90000000+0x60000000`，所以
+  USB 的 SMMU context 很可能必须做成 translation，而不是 bypass。`kits/ArmSmmu4K` 有现成的表代码。
+- 里程碑与判据（M0 控制器活 → M1 枚举 → M2 mux → M3 配对 → M4 AFC）、工作量（要数据访问约 4-6 周；
+  只要枚举约 2-4 周）、以及 10 个待查项（U1 interrupter 数、U2 register map、U3 配置字典来源、
+  U4 PTP 功能缺失…）都在那份文档里。
+
+## 13. 上游可同步项（2026-10-25，只读调研）
+
+见 **[HANDOFF-pipa-upstream.md](HANDOFF-pipa-upstream.md)**。一句话：**Turnip 有几条小补丁正中圆角
+（其中两条是"未初始化数据"级别的 bug，而且我们的 pin 上都有），metal2vulkan 落后 66 个提交
+（第一个是 +107k 行的 squash，只能整体同步）且改法正中 10.10–10.12 的渲染侧 CPU，但会让
+"padded 行 alias" 那条优化作废；**扫描输出拷贝上游无解**（两处关键条件逐字未变）。Linux 侧
+`sm8250-xiaomi-pipa.dts` 与我们的 P0 读数逐条吻合，并给出 display SMMU 是多个 stream
+（`iommus = <&apps_smmu 0x820 0x402>`）——这是 10.13 挂死的新线索。
+
+建议顺序（都在那份文件 §5.3）：先摘 Turnip 的一行级修复（`GRAS_MODE_CNTL`、A650
+`TPL1_DBG_ECO_CNTL`），再摘 GMEM 规划两条并打开 `pipa_gmemin` 验圆角；metal2vulkan 单独排期，
+动之前先确认"全影子"不会把 5 ms/pass 还回来。
