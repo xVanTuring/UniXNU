@@ -586,3 +586,98 @@ mdss: CTL0 layer 01000005 01000028 flush 00000000 intf 00000006 pipe 00000000
   要让 UI 显示 WiFi 只能自己实现 `IO80211.framework` 的 user client ABI（兄弟项目 giulia 在 iOS 16 上做过）。
 - 有可直接借的先例：`tycykp/UniXNU-OnePlus-Ace5` 的 `ios16/wifi/`（PCIe/SMMU/MHI/QMI/DP/RSN + Apple ABI）。
   估量：扫到 AP 约 2–3 个月，能上网再 2 个月，UI 显示再加 1–2 个月；细节和判据在那份文件 §4/§5。
+
+## 10.12 卡顿是不是周期性的：W5 / H1-H5 / X 三行（2026-10-25 第六轮）
+
+用户实测：App Library 卡顿**间歇性**（卡一阵、顺一阵），设置转场也卡且第二次打开仍卡（排除首次编译）。`K` 行是 32 条环 + 去重打印，
+只能看到零零散散两条重帧（`t=301.9s rp=16 dr=78 kpx=36068 gpu=13789`、`t=313.9s rp=10 dr=122 kpx=30456 ctc=0`，正常帧
+`rp=0-6 kpx=5062-10310`），看不出节奏。
+
+新增（`NativeBridgeMetalFrontend.mm`，默认开、零参数）：
+
+- **`W5`**：每 5 秒（或界面静止 ≥200 ms 时提前）发布一个窗口：`fps`（窗口内帧数 / 帧跨度）、`on`（≤16.7 ms 的帧间隔）、
+  `late`（17–33）、`slow`（≥33，只统计 <200 ms 的间隔，静止不算掉帧）、`gpu`/`p99`（窗口内"带 render pass 的命令缓冲"的
+  GPU 时间均值/99 分位，µs）、`rp`（每帧 pass 数 ×10）、`kpx`（每帧像素/1024）。
+- **`X`**：进程启动以来 GPU 时间 >8/16/32 ms 的 commit 数，以及 commit→callback >16/32 ms 的 commit 数。
+- **`H1`..`H5`**：最近 60 秒最重的 5 个 commit，按 GPU 时间降序：`t=<uptime 秒>`、`rp/dr/kpx`（构成）、`tex`/`buf`（该 commit
+  之前的 `replaceRegion`+新建纹理+surface 导入 / 新建 buffer+`copyFromBuffer:toTexture:` 次数，在编码线程上计数、随 commit 记录）、
+  `gpu`/`ctc`。
+
+为此砍掉：`Q`（K 的图例）、`K1`/`K2`、`E`（age/scheduled）、`T function`、`J resource checks` —— 共 6 行，换 7 行，固定行 37 行，
+`Z`（Turnip pass 记录）还剩 11 行。K 行的"逐 commit 明细"由 H 行取代（带时间戳、按 GPU 排序、跨 60 秒），要看普通帧就用 `W5`
+的聚合；真需要逐帧还能从 `S`/`A2`/`D`/`C`/`B` 的均值反推。
+
+## 12. 2026-10-25 收尾状态（交接用）
+
+### 一句话
+
+设备可用：桌面/翻页 **47–52 fps**（62–72% 的帧在 16.7 ms 内），圆角正确，电池正常，挂死会自己回来。
+**App Library 与设置转场仍然卡**（10–37 fps，模糊重建时最差），根因已锁定但未修好。
+
+### 这一天的四条否定结论（别再试）
+
+圆角 4×4 台阶（= GMEM 下 framebuffer fetch 读错）试过并全部**否掉**：
+
+1. 回移四条上游 A650 修复（`tu_pass.cc` gmem_offset、`tu_util.cc` tile divisor、`GRAS_MODE_CNTL`、`TPL1_DBG_ECO_CNTL`）—— 仍 4×4
+2. 每个 draw 前 UCHE 失效（`pipa_iaflush`）—— 仍 4×4，排除缓存过期
+3. 清描述符 `TILE_ALL` 位（`tu_cmd_buffer.cc:2930`，日志确认 d3 从 `0x08000000` 变 `0x30`）—— 仍 4×4
+4. 放开 Apple 家族让 CA 回单 pass 模糊 —— **更慢**（pass 7.5→12.5 ms GPU，submit-to-retire 9.3→18.1 ms）
+
+唯一已知有效的规避是当前默认：`tu_cmd_buffer.cc` 的 `use_sysmem_rendering()` 里"带输入附件的 pass 走系统内存"
+（`pipa_gmemin` 可反向打开 GMEM 做实验）。`pipa_iaplain`（读图像自身描述符）画面正确但在其它场景读到未 resolve
+的内存 → **紫屏 + 2–5 fps，不可用**。
+
+### 剩余三条路（含代价）
+
+- **A 真修 fetch bug**：需要最小复现场景 + 逐 tile 对比 GPU 实际读到的内容，**几天级**，必须专门开时段。
+  已知线索：`Z ia` 行会打出描述符（`ia <w>x<h> t<tileW>x<tileH> p<pitch> o<gmem_offset> c<cpp> d1.. d5..`），
+  上游 `r3d_src_gmem`（`tu_clear_blit.cc:1613`）是同一类"gmem tile 当纹理读"且**正确**的参照实现。
+- **B 内存分段**（见 `HANDOFF-pipa-memory.md`）：阶段 0 已完成（页表池 16→34，
+  `patches/xnu/zzzz-bootstrap-table-pool.patch` + `native-4k-bootstrap-capacity.patch` 已改）。阶段 1 只需把
+  `board.toml` 的 `owned_memory_size` 改成 `0x1F0000000` 试 +2 GiB；阶段 2 多段支持可 +8 GiB。
+  **bank1（0x80000000，888 MB）整段在 4 GiB 以下**，划 128 MB 给显示即可做零拷贝而不碰 SMMU。
+- **C 收在这里**：当前状态可日常使用。
+
+### App Library 为什么卡（数据）
+
+`W5` 行（每 5 秒一窗口）在 App Library 期间：`rp=191..200`（19–20 个 pass/帧）、`kpx=27956..28573`（28 Mpx/帧）、
+`gpu=9252`。正常桌面是 `rp=46`（4.6 个 pass）、`kpx=5062`（5 Mpx）。一帧 28 Mpx 在 A650 上光是填充就要 ~13 ms，
+所以 10–37 fps。pass 数爆炸的根源就是上面那个 fetch bug（CA 被逼用多 pass 模糊代替单 pass）。
+
+### 怎么跑一轮（给下一班）
+
+```sh
+cd /Users/xvan/agents-home/UniXNU-pipa
+env PIPA_GPU_USERSPACE=/Users/xvan/agents-home/UniXNU/out/pipa/gpu-metal \
+  scripts/kernel-round.sh --arg pipa-gesture=60 20      # 自动解锁/翻页 3 次(到 App Library)/停 12 s/翻回/点按
+```
+- 重试用 `/tmp/round-retry.sh`（我写的壳：swaps < 30 自动重跑，最多 3 次）
+- 常用参数：`pipa-tu=1..5`（预置 Turnip 选项组，8 字节）、`pipa-flip=1|2`（零拷贝实验，默认关）、
+  `pipa-wd=0|2`（看门狗）、`pipa-gesture=<秒>`
+- 命令行总长上限 **1000 字节**，当前基础约 975（含 withhold 31）
+- 日志：`out/pipa/device-logs/<ts>/pstore/console-ramoops-0`，先 `tr -d '\000'`
+- **出插件**：`out/pipa/tree` 下 `python3 scripts/build-adreno-metal-plugin.py` → `make-owner-trust-bundle.py` →
+  `cp build/adreno-metal-plugin/owner-trust.bundle ../gpu-metal/` → 把 `../gpu-metal/gpu-addon-clients.bin` 改名 →
+  `make-gpu-addon.py --publish --clients iconservicesagent,Preferences ../gpu-metal/gpu-addon-clients.bin`
+- **mesa 改了要重建**：`PATH=$PWD/.cache/mesa-tools/bin:$PWD/.cache/mesa-venv/bin:$PATH ninja -C build/mesa-tu-ios src/freedreno/vulkan/libvulkan_freedreno.dylib`
+  （`build-turnip-darwin.py` 会因工作树里的诊断补丁和补丁校验不符而拒绝，属已知）
+
+### 今天新增的基建（都已提交）
+
+- **PMIC PON 硬件看门狗**（默认开、60 s 咬合、2 s 喂）：挂死会自动 warm 复位回 fastboot，**实测有效**
+  （`wd: armed …` / `test mode, stopping the feed at 15 s`，日志恰好在最后一次喂狗后 60 s 中断，设备自己回来）
+- **合成手势注入**（`pipa-gesture`）：上滑解锁 → 左翻 3 次（到 App Library）→ 停 12 s → 翻回 → 点按
+- **电池驱动**（`IOPMPowerSource`，`match 1`）：100% / 4481 mV / 34.5 °C / 充电状态
+- **遥测**：`W5` 5 秒窗口、`H1..H5` 最近 60 秒最重帧、`X` 尖峰计数、`A0..A8`/`D`/`C`/`B` 分段计时、
+  `Z ia` 输入附件描述符、`Z rp … r=<原因>` 每个 pass 为什么走 sysmem
+- **崩溃符号化** `scripts/symbolicate-cache-crash.py`（把 `[xnu] crash:` 解回函数名）
+- **调查文档**：`HANDOFF-pipa-{memory,usb,wifi,upstream,zerocopy}.md`
+
+### 未完成/待决策
+
+1. 圆角 fetch bug（见 A）
+2. 内存阶段 1/2（见 B）
+3. **设置 → 辅助功能闪退的修复尚未实机验证**（Apple2 只对 Preferences 放行，需真的打开那个页面看 `sig11 PC0` 是否消失）
+4. 约 10% 的启动会停在"合成器不出帧"（Apple logo 或黑屏）；已定位到 SpringBoard 主线程在 `kevent_id` 空等、
+   无 `HOTS` 行，但根因未找到。轮次壳会自动重试兜住
+5. mesa 侧的诊断补丁仍未整理成 `patches/mesa/*.patch`（工作树里有一批未提交的 `tu_pipa_*` 诊断）
