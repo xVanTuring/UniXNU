@@ -681,3 +681,29 @@ env PIPA_GPU_USERSPACE=/Users/xvan/agents-home/UniXNU/out/pipa/gpu-metal \
 4. 约 10% 的启动会停在"合成器不出帧"（Apple logo 或黑屏）；已定位到 SpringBoard 主线程在 `kevent_id` 空等、
    无 `HOTS` 行，但根因未找到。轮次壳会自动重试兜住
 5. mesa 侧的诊断补丁仍未整理成 `patches/mesa/*.patch`（工作树里有一批未提交的 `tu_pipa_*` 诊断）
+
+## 13. 其余已知问题与坑（2026-10-25 收尾补记）
+
+这些不影响主线，但下一班会踩，或者会误判：
+
+1. **vsync 通知机制从来没被用过**：`display: prep … vs 60Hz sent=0 arms=0 idle=0 late=0`、`vs … wants=0 age=221336ms`。
+   定时器建起来了（`st=1 rf=1`），但没有客户端注册、一次 tick 都没发过。合成器靠自己的节奏出帧。
+   **所以 `NativeMobileDisplay` 里那个 vsync 看门狗（`native_legacy_vsync_kick`，commit `f1b5ffb`）实际上是空转的**
+   —— 它只在"有客户端在等"时才动作。那段代码无害，但别以为它修了"偶发不画"。
+2. **"偶发不画"的真实形态**：SpringBoard 主线程停 `_filt_wlwait_continue`（kqueue 空等）、线程数只有 8–11（正常 12–17）、
+   `HOTS` 行完全缺失、画面停在 `13 of 1536 samples` 那个全黑 blank swap。约 10% 的启动。根因未找到。
+   用 `scripts/round-retry.sh` 兜（swaps<30 自动重跑，最多 3 次）。
+3. **metal2vulkan 的补丁校验会因为 git 缩写长度而误报**：`build-native-metal-bridge.py` 要求工作树 diff 等于
+   "pin + 记录补丁"，而补丁里写的是 7 位缩写、新版 git 产出 8 位 → 报 "Translator source differs"。
+   修法：`git -C .cache/gpu-reference/metal2vulkan config core.abbrev 7`（缓存目录重建后要再做一次）。
+4. **mesa 工作树里还有未提交的改动**：今天新增的 `pipa_iaplain` / `pipa_iaflush` / `pipa_uchegmem` 三个开关、
+   `Z ia` 诊断行、`Z rp … r=<原因>`、以及 **TILE_ALL 那一行修复**（`tu_cmd_buffer.cc:2930`，
+   对本机无效但确实是上游 a630/640/650/680/702 的 bug，值得单独报 MR）。这些都还没整理成 `patches/mesa/*.patch`。
+5. **`pipa_iaplain` 是陷阱**：它让圆角正确，但在别的场景读到未 resolve 的内存 → 紫屏 + 2–5 fps。别当修法用。
+6. **硬件看门狗已默认开启**（60 s 咬合）。如果某轮实验让内核合法地长时间不调度喂狗线程，会被它误杀 ——
+   `pipa-wd=0` 可关。另外苹果用户态 `watchdogd` 仍报 "hardware watchdog not implemented"，
+   因为那是它自己的检测，没接我们的 PMIC 看门狗。
+7. **命令行预算**：上限 1000 字节，基础约 975（含 `pipa-metal-withhold=apple-families` 31 字节）。
+   挤不下时用 `pipa-tu=1..5`（8 字节）这类预置组合，别去删 `pipa-touch`/`pipa-buttons`（会让人没法解锁）。
+8. **构建/出包的完整顺序**见第 12 节；忘了顺序最容易漏的是 owner-trust bundle（CDHash 变了就必须重做，
+   否则 Data seed 与信任对不上，插件不会加载）。
