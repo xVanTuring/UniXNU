@@ -1,0 +1,595 @@
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 1d33085..53d9f5b 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5764,6 +5764,8 @@ tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
+    if (cond_exec)
+       tu_begin_load_store_cond_exec(cmd, cs, true);
+ 
++   if (tu_pipa_notes_enabled())
++      tu_pipa_note(TU_DEBUG(3D_LOAD) || cmd->state.pass->has_fdm || (a != gmem_a) ? "ld 3d" : "ld a2d");
+    if (TU_DEBUG(3D_LOAD) ||
+        cmd->state.pass->has_fdm ||
+        /* Replicating unresolve seems to not work and the blob never uses it.
+@@ -6249,6 +6251,16 @@ tu_store_gmem_attachment(struct tu_cmd_buffer *cmd,
+ 
+    bool fast_path_conditional = use_fast_path && cmd->state.pass->has_fdm;
+ 
++   /* pipa: the store path of this pass for the plugin's telemetry (diagnostic; TU_DEBUG pipa_notes). */
++   if (tu_pipa_notes_enabled()) {
++      const VkRect2D *area = &cmd->state.render_areas[0];
++      char note[120];
++      snprintf(note, sizeof note, "st %s u%d %ux%u+%d+%d f%d s%d", use_fast_path ? "fast" : "a2d", unaligned,
++               area->extent.width, area->extent.height, area->offset.x, area->offset.y, (int) dst->format,
++               (int) dst->samples);
++      tu_pipa_note(note);
++   }
++
+    trace_start_gmem_store(&cmd->rp_trace, cs, cmd, dst->format, use_fast_path, unaligned);
+ 
+    /* Unconditional store should happen only if attachment was cleared,
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 3049aab..afdbfb1 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1416,6 +1416,26 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
++   /* pipa: a pass that reads its own attachments back (framebuffer fetch) stays in system memory. In GMEM that read goes through
++    * tu_emit_input_attachments' patched descriptor, and on this board the partially transparent pixels come back in 4 x 4 blocks
++    * (2026-10-25: the rounded corners of the UI, the only edges with alpha, were chamfered; the same pass in system memory is smooth and
++    * its submit-to-retire mean halves, 11.8 ms against 6.7 ms). TU_DEBUG's "pipa_gmemin" puts such passes back into GMEM for whoever
++    * finds the descriptor's fault. */
++   if (cmd->state.pass && !tu_pipa_gmem_input_attachments() && cmd->state.pass->subpasses[0].input_count > 0) {
++      cmd->state.rp.gmem_disable_reason = "pipa: input attachments";
++      return true;
++   }
++
++   /* pipa: the small-area switch above, diagnostic. */
++   {
++      const unsigned limit = tu_pipa_small_threshold();
++      const VkRect2D *area = &cmd->state.render_areas[0];
++      if (limit && (uint64_t) area->extent.width * area->extent.height <= limit) {
++         cmd->state.rp.gmem_disable_reason = "pipa small render area";
++         return true;
++      }
++   }
++
+    if (cmd->state.rp.disable_gmem) {
+       /* gmem_disable_reason is set where disable_gmem is set. */
+       return true;
+@@ -2218,6 +2238,21 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
+ 
+    tu_cs_emit_regs(cs, GRAS_MODE_CNTL(CHIP, 0x2));
+ 
++   /* pipa: TU_DEBUG's "pipa_uchegmem" programs the UCHE gmem window. On Linux the kernel does it (msm writes
++    * UCHE_GMEM_RANGE_MIN/MAX; a hang dump in src/freedreno/tests/reference/crash.log shows 0x100000..0x1ff000) and nothing on this
++    * port writes it, which is a real gap worth closing in the kernel's GPU init - but it is not the cause of the 4 x 4 blocks: the
++    * every-draw UCHE invalidation in tu_pipa_ia_flush() changes nothing, so the fetched data is not stale (see
++    * tu_emit_input_attachments(), which now clears TILE_ALL). Kept off by default for that reason. */
++   if (tu_pipa_uche_gmem()) {
++      const uint64_t base = dev->physical_device->gmem_base;
++      const uint64_t end = base + dev->physical_device->gmem_size;
++
++      tu_cs_emit_write_reg(cs, REG_A6XX_UCHE_GMEM_RANGE_MIN, (uint32_t) base);
++      tu_cs_emit_write_reg(cs, REG_A6XX_UCHE_GMEM_RANGE_MIN + 1, (uint32_t) (base >> 32));
++      tu_cs_emit_write_reg(cs, REG_A6XX_UCHE_GMEM_RANGE_MAX, (uint32_t) end);
++      tu_cs_emit_write_reg(cs, REG_A6XX_UCHE_GMEM_RANGE_MAX + 1, (uint32_t) (end >> 32));
++   }
++
+    tu_cs_emit_write_reg(cs, REG_A6XX_RB_UNKNOWN_8818, 0);
+ 
+    if (CHIP == A6XX) {
+@@ -2875,6 +2910,8 @@ tu_emit_input_attachments(struct tu_cmd_buffer *cmd,
+       }
+ 
+       if (!gmem || !subpass->input_attachments[i / 2].patch_input_gmem ||
++          /* pipa: diagnostic, see tu_pipa_ia_plain(). */
++          tu_pipa_ia_plain() ||
+           /* Skip GMEM patching when tiling is impossible as we may get
+            * assertion failures from register packing below.
+            */
+@@ -2885,6 +2922,12 @@ tu_emit_input_attachments(struct tu_cmd_buffer *cmd,
+ 
+       /* patched for gmem */
+       tu_desc_set_tile_mode<CHIP>(dst, TILE6_2);
++      /* A gmem tile is plain rows at pitch tile0.width * cpp, not the tiled (block interleaved) layout the image has in RAM, but
++       * TILE_ALL is inherited from the view of a UBWC image, where it is set. Leaving it set made the hardware permute pixels
++       * inside each 4 x 4 block of the tile, which is what the rounded corners showed as 4 x 4 steps until 2026-10-25.
++       * tu_clear_blit.cc's r3d_src_gmem(), the other place that reads a gmem tile back as a texture, clears it for the same
++       * reason. */
++      tu_desc_set_tile_all<CHIP>(dst, false);
+ 
+       if (!iview->view.is_mutable)
+          tu_desc_set_swap<CHIP>(dst, WZYX);
+@@ -2928,6 +2971,20 @@ tu_emit_input_attachments(struct tu_cmd_buffer *cmd,
+ 
+       tu_desc_set_addr<CHIP>(dst, va);
+ 
++      /* pipa: the numbers the gmem fetch actually uses, for the plugin's telemetry (diagnostic; tu_pipa_note dedupes). The tile
++       * geometry is the only thing that can make this descriptor differ from the working gmem blit, so it is logged with it. */
++      if (tu_pipa_notes_enabled()) {
++         uint32_t w, h;
++         char note[120];
++
++         tu_desc_get_dim<CHIP>(dst, &w, &h);
++         snprintf(note, sizeof note, "ia %ux%u t%ux%u p%u o%x c%u d1%x d2%x d3%x d5%x",
++                  w, h, tiling->tile0.width, tiling->tile0.height,
++                  tiling->tile0.width * cpp, gmem_offset, cpp,
++                  dst[1], dst[2], dst[3], dst[5]);
++         tu_pipa_note(note);
++      }
++
+       memcpy(&texture.map[i * FDL6_TEX_CONST_DWORDS], dst, sizeof(dst));
+    }
+ 
+@@ -4050,10 +4107,102 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+    tu_autotune::rp_key_opt rp_key = cmd_buffer->device->autotune->emit_preempt_latency_tracking_rp_hash(cmd_buffer);
+ 
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+-   if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
++   const bool use_sysmem = use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key);
++   /* pipa: the pass's GPU time (tu_pipa_pass_slot): the always-on counter before it, and after a WFI at its end. */
++   const uint64_t pipa_times = tu_pipa_pass_slot(cmd_buffer->device, cmd_buffer->state.render_areas[0].extent.width,
++                                                 cmd_buffer->state.render_areas[0].extent.height, use_sysmem,
++                                                 cmd_buffer->state.rp.gmem_disable_reason);
++   if (pipa_times) {
++      tu_cs_emit_pkt7(&cmd_buffer->cs, CP_REG_TO_MEM, 3);
++      tu_cs_emit(&cmd_buffer->cs, CP_REG_TO_MEM_0_REG(__CP_ALWAYS_ON_COUNTER<CHIP>({}).reg) | CP_REG_TO_MEM_0_CNT(2) |
++                                  CP_REG_TO_MEM_0_64B);
++      tu_cs_emit_qw(&cmd_buffer->cs, pipa_times);
++   }
++   /* pipa: one line per distinct render pass for the plugin's telemetry (diagnostic; TU_DEBUG pipa_notes). */
++   if (tu_pipa_notes_enabled()) {
++      const struct tu_render_pass *pass = cmd_buffer->state.pass;
++      const VkRect2D *area = &cmd_buffer->state.render_areas[0];
++      const struct tu_render_pass_attachment *att = NULL;
++      for (unsigned i = 0; pass && i < pass->subpass_count && !att; i++) {
++         const struct tu_subpass *sp = &pass->subpasses[i];
++         for (unsigned j = 0; j < sp->color_count; j++) {
++            const uint32_t a = sp->color_attachments[j].attachment;
++            if (a != VK_ATTACHMENT_UNUSED) {
++               att = &pass->attachments[a];
++               break;
++            }
++         }
++      }
++      /* The depth/stencil attachment as well: its stencil is the shape clip that could be quantised. */
++      const struct tu_render_pass_attachment *ds = NULL;
++      for (unsigned i = 0; pass && i < pass->subpass_count && !ds; i++) {
++         const uint32_t a = pass->subpasses[i].depth_stencil_attachment.attachment;
++         if (a != VK_ATTACHMENT_UNUSED)
++            ds = &pass->attachments[a];
++      }
++      char note[120];
++      if (!use_sysmem && cmd_buffer->state.tiling && cmd_buffer->state.tiling->possible) {
++         int colors[4] = {-1, -1, -1, -1};
++      if (pass) {
++         const struct tu_subpass *sp0 = &pass->subpasses[0];
++         for (unsigned j = 0; j < sp0->color_count && j < 4; j++) {
++            const uint32_t a = sp0->color_attachments[j].attachment;
++            if (a != VK_ATTACHMENT_UNUSED)
++               colors[j] = (int) pass->attachments[a].format;
++         }
++      }
++      unsigned cw = 0, ch = 0, lvl = 0;
++      if (pass) {
++         const uint32_t a = pass->subpasses[0].color_attachments[1].attachment;
++         if (a != VK_ATTACHMENT_UNUSED) {
++            const struct tu_image_view *iv = cmd_buffer->state.attachments[a];
++            cw = iv->vk.extent.width;
++            ch = iv->vk.extent.height;
++            lvl = 0;
++         }
++      }
++      snprintf(note, sizeof note, "rp %ux%u+%d+%d gmem c%d.%d.%d.%d a2 %ux%uL%u ds%d s%d t%ux%u g%x div%u st%d",
++                  area->extent.width, area->extent.height, area->offset.x, area->offset.y,
++                  colors[0], colors[1], colors[2], colors[3], cw, ch, lvl,
++                  ds ? (int) ds->format : -1, att ? (int) att->samples : 0,
++                  cmd_buffer->state.tiling->tile0.width, cmd_buffer->state.tiling->tile0.height,
++                  att ? att->gmem_offset[cmd_buffer->state.gmem_layout] : 0, cmd_buffer->state.gmem_layout_divisor,
++                  ds ? (int) ds->store_stencil : 0);
++      } else {
++         snprintf(note, sizeof note, "rp %ux%u+%d+%d sysmem f%d/%d s%d r=%.20s",
++                  area->extent.width, area->extent.height, area->offset.x, area->offset.y,
++                  att ? (int) att->format : -1, ds ? (int) ds->format : -1, att ? (int) att->samples : 0,
++                  cmd_buffer->state.rp.gmem_disable_reason ? cmd_buffer->state.rp.gmem_disable_reason : "-");
++      }
++      tu_pipa_note(note);
++      /* A second line: the subpass shape, where GMEM's input attachment descriptor (tu_emit_input_attachments) would be used. */
++      {
++         unsigned inputs = 0, cpp = 0, mincpp = 0, ncolors = 0;
++         if (pass) {
++            inputs = pass->subpasses[0].input_count;
++            mincpp = pass->min_cpp;
++            for (unsigned k = 0; k < pass->subpasses[0].color_count && k < 8; k++)
++               if (pass->subpasses[0].color_attachments[k].attachment != VK_ATTACHMENT_UNUSED) ncolors++;
++            const uint32_t a0 = pass->subpasses[0].color_attachments[0].attachment;
++            cpp = a0 != VK_ATTACHMENT_UNUSED ? pass->attachments[a0].cpp : 0;
++         }
++         char note2[120];
++         snprintf(note2, sizeof note2, "rpx sp%u in%u c%u cpp%u mn%u %s",
++                  pass ? pass->subpass_count : 0, inputs, ncolors, cpp, mincpp, use_sysmem ? "sysmem" : "gmem");
++         tu_pipa_note(note2);
++      }
++   }
++   if (use_sysmem)
+       tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx);
+    else
+       tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets);
++   if (pipa_times) {
++      tu_cs_emit_wfi(&cmd_buffer->cs);
++      tu_cs_emit_pkt7(&cmd_buffer->cs, CP_REG_TO_MEM, 3);
++      tu_cs_emit(&cmd_buffer->cs, CP_REG_TO_MEM_0_REG(__CP_ALWAYS_ON_COUNTER<CHIP>({}).reg) | CP_REG_TO_MEM_0_CNT(2) |
++                                  CP_REG_TO_MEM_0_64B);
++      tu_cs_emit_qw(&cmd_buffer->cs, pipa_times + 8);
++   }
+ }
+ 
+ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
+@@ -8301,6 +8450,29 @@ tu_flush_dynamic_input_attachments(struct tu_cmd_buffer *cmd)
+    }
+ }
+ 
++/* pipa: true when this subpass reads at least one attachment that is written in GMEM, i.e. when tu_emit_input_attachments patches a
++ * descriptor to point into gmem. Diagnostic only. */
++static bool
++tu_pipa_subpass_reads_gmem(struct tu_cmd_buffer *cmd)
++{
++   const struct tu_subpass *subpass = cmd->state.subpass;
++
++   if (!subpass || !cmd->state.pass || !cmd->state.tiling ||
++       !cmd->state.tiling->possible)
++      return false;
++
++   for (unsigned i = 0; i < subpass->input_count; i++) {
++      const uint32_t a = subpass->input_attachments[i].attachment;
++
++      if (a != VK_ATTACHMENT_UNUSED &&
++          subpass->input_attachments[i].patch_input_gmem &&
++          cmd->state.pass->attachments[a].gmem)
++         return true;
++   }
++
++   return false;
++}
++
+ template <chip CHIP>
+ static VkResult
+ tu6_draw_common(struct tu_cmd_buffer *cmd,
+@@ -8358,6 +8530,15 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+    if (cmd->state.dirty & TU_CMD_DIRTY_FS)
+       tu_flush_dynamic_input_attachments(cmd);
+ 
++   /* pipa: TU_DEBUG's "pipa_iaflush" re-invalidates UCHE before every draw that reads gmem, which upstream only does once per subpass
++    * (tu_subpass::feedback_invalidate) or once per dynamic renderpass. See tu_pipa_ia_flush(): if this alone makes the corners smooth,
++    * the gmem fetch was returning lines that the RB had already overwritten. Diagnostic only, and expensive: it stalls every such
++    * draw. */
++   if (tu_pipa_ia_flush() && tu_pipa_subpass_reads_gmem(cmd))
++      cmd->state.renderpass_cache.flush_bits |=
++         TU_CMD_FLAG_CACHE_INVALIDATE | TU_CMD_FLAG_BLIT_CACHE_CLEAN |
++         TU_CMD_FLAG_WAIT_FOR_IDLE;
++
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
+ 
+   if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 8b0aef1..86ed8bb 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -665,6 +665,12 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       ubwc_enabled = false;
+    }
+ 
++   /* pipa: the layout switch above, diagnostic. */
++   if (tu_pipa_linear()) {
++      ubwc_enabled = false;
++      force_linear_tile = true;
++   }
++
+    /* Layout computation begins here */
+    enum a6xx_tile_mode tile_mode = TILE6_3;
+ #if DETECT_OS_LINUX || DETECT_OS_BSD
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index cfc03d6..a1e2fa5 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -6,7 +6,10 @@
+ #include "tu_util.h"
+ 
+ #include <errno.h>
++#include <pthread.h>
++#include <stdlib.h>
+ #include <stdarg.h>
++#include <string.h>
+ 
+ #include "util/os_file.h"
+ #include "util/os_file_notify.h"
+@@ -640,3 +643,253 @@ tu_dbg_log_gmem_load_store_skips(struct tu_device *device)
+ 
+    pthread_mutex_unlock(&device->submit_mutex);
+ }
++
++/* pipa: the last distinct render passes as text, for the plugin's kernel-log telemetry (NativeBridgeMetalFrontend.mm reads it with
++ * dlsym). Turnip has no log route of its own in the render server on this device, and the corner question of 2026-10-24 (4-row slices
++ * of a GMEM pass ending up in the wrong place) needs the pass's own numbers: area, format, samples, mode, bin geometry, store path.
++ * Diagnostic only; nothing here changes a result. */
++static char tu_pipa_notes[32][120];
++static unsigned tu_pipa_note_count;
++static pthread_mutex_t tu_pipa_notes_lock = PTHREAD_MUTEX_INITIALIZER;
++
++__attribute__((visibility("default"))) void tu_pipa_note(const char *text)
++{
++   pthread_mutex_lock(&tu_pipa_notes_lock);
++   for (unsigned i = 0; i < tu_pipa_note_count; i++)
++      if (!strcmp(tu_pipa_notes[i], text))
++         goto out;
++   if (tu_pipa_note_count < ARRAY_SIZE(tu_pipa_notes)) {
++      snprintf(tu_pipa_notes[tu_pipa_note_count], sizeof tu_pipa_notes[0], "%s", text);
++      tu_pipa_note_count++;
++   }
++out:
++   pthread_mutex_unlock(&tu_pipa_notes_lock);
++}
++
++bool
++tu_pipa_notes_enabled(void)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      enabled = debug && strstr(debug, "pipa_notes") ? 1 : 0;
++   }
++   return enabled;
++}
++
++/* pipa: the GPU time of each render pass instance (tu_cmd_render: CP_ALWAYS_ON_COUNTER, 19.2 MHz, before the pass and after a WFI at its
++ * end) in a ring of slots, summed by the pass's area and mode at each dump: which passes hold the GPU while an app opens (2026-10-25:
++ * 20 ms of GPU a frame for about 15 passes and 20 megapixels). Diagnostic only. */
++#define PIPA_TS_SLOTS 16384
++#define PIPA_TS_SHAPES 24
++struct pipa_ts_shape {
++   uint32_t width, height;
++   bool sysmem;
++   uint64_t count, ticks, longest;
++   const char *reason;   /* why the last such pass went to system memory (gmem_disable_reason) */
++};
++static struct tu_bo *pipa_ts_bo;
++static struct tu_device *pipa_ts_device;
++static uint8_t pipa_ts_shape_of[PIPA_TS_SLOTS];
++static struct pipa_ts_shape pipa_ts_shapes[PIPA_TS_SHAPES];
++static unsigned pipa_ts_shape_count;
++static uint32_t pipa_ts_next;
++static pthread_mutex_t pipa_ts_lock = PTHREAD_MUTEX_INITIALIZER;
++
++uint64_t
++tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool sysmem, const char *reason)
++{
++   pthread_mutex_lock(&pipa_ts_lock);
++   if (!pipa_ts_bo && !pipa_ts_device) {
++      pipa_ts_device = dev;
++      if (tu_bo_init_new(dev, NULL, &pipa_ts_bo, PIPA_TS_SLOTS * 16, TU_BO_ALLOC_NO_FLAGS, "pipa pass times") != VK_SUCCESS) {
++         pipa_ts_bo = NULL;
++      } else if (tu_bo_map(dev, pipa_ts_bo, NULL) != VK_SUCCESS) {
++         tu_bo_finish(dev, pipa_ts_bo);
++         pipa_ts_bo = NULL;
++      } else {
++         memset(pipa_ts_bo->map, 0, PIPA_TS_SLOTS * 16);
++      }
++   }
++   if (!pipa_ts_bo || dev != pipa_ts_device) {
++      pthread_mutex_unlock(&pipa_ts_lock);
++      return 0;
++   }
++   unsigned shape = 0;
++   for (; shape < pipa_ts_shape_count; shape++)
++      if (pipa_ts_shapes[shape].width == width && pipa_ts_shapes[shape].height == height && pipa_ts_shapes[shape].sysmem == sysmem)
++         break;
++   if (shape == pipa_ts_shape_count) {
++      if (pipa_ts_shape_count < PIPA_TS_SHAPES - 1) {
++         pipa_ts_shapes[shape] = (struct pipa_ts_shape) {width, height, sysmem, 0, 0, 0, NULL};
++         pipa_ts_shape_count++;
++      } else {
++         shape = PIPA_TS_SHAPES - 1;   /* the rest together */
++      }
++   }
++   if (sysmem)
++      pipa_ts_shapes[shape].reason = reason;
++   const uint32_t slot = pipa_ts_next++ % PIPA_TS_SLOTS;
++   uint64_t *times = (uint64_t *) pipa_ts_bo->map + slot * 2;
++   times[0] = times[1] = 0;
++   pipa_ts_shape_of[slot] = (uint8_t) shape;
++   pthread_mutex_unlock(&pipa_ts_lock);
++   return pipa_ts_bo->iova + slot * 16;
++}
++
++__attribute__((visibility("default"))) unsigned
++tu_pipa_pass_dump(char *out, unsigned size)
++{
++   unsigned at = 0;
++   out[0] = 0;
++   pthread_mutex_lock(&pipa_ts_lock);
++   if (pipa_ts_bo) {
++      volatile uint64_t *times = (volatile uint64_t *) pipa_ts_bo->map;
++      for (unsigned slot = 0; slot < PIPA_TS_SLOTS; slot++) {
++         const uint64_t begin = times[slot * 2], end = times[slot * 2 + 1];
++         if (!begin || !end)
++            continue;
++         if (end > begin) {
++            struct pipa_ts_shape *shape = &pipa_ts_shapes[pipa_ts_shape_of[slot]];
++            shape->count++;
++            shape->ticks += end - begin;
++            if (end - begin > shape->longest)
++               shape->longest = end - begin;
++         }
++         times[slot * 2] = times[slot * 2 + 1] = 0;
++      }
++      /* The shapes by their GPU time, most first: count, total and mean (19.2 MHz ticks as ms and us) and the longest. */
++      bool shown[PIPA_TS_SHAPES] = {};
++      for (unsigned row = 0; row < 8; row++) {
++         int best = -1;
++         for (unsigned i = 0; i < PIPA_TS_SHAPES; i++)
++            if (!shown[i] && pipa_ts_shapes[i].count && (best < 0 || pipa_ts_shapes[i].ticks > pipa_ts_shapes[best].ticks))
++               best = (int) i;
++         if (best < 0)
++            break;
++         shown[best] = true;
++         const struct pipa_ts_shape *shape = &pipa_ts_shapes[best];
++         int n = snprintf(out + at, size - at, "PT %ux%u %s n%llu %llums mean %lluus max %lluus %.24s\n", shape->width, shape->height,
++                          best == PIPA_TS_SHAPES - 1 ? "other" : shape->sysmem ? "sys" : "gmem", (unsigned long long) shape->count,
++                          (unsigned long long) (shape->ticks / 19200), (unsigned long long) (shape->ticks * 10 / 192 / shape->count),
++                          (unsigned long long) (shape->longest * 10 / 192),
++                          shape->sysmem && shape->reason ? shape->reason : "");
++         if (n <= 0 || (unsigned) n >= size - at)
++            break;
++         at += (unsigned) n;
++      }
++   }
++   pthread_mutex_unlock(&pipa_ts_lock);
++   return at;
++}
++
++__attribute__((visibility("default"))) unsigned tu_pipa_note_dump(char *out, unsigned size)
++{
++   unsigned at = 0;
++   pthread_mutex_lock(&tu_pipa_notes_lock);
++   for (unsigned i = 0; i < tu_pipa_note_count && at + 2 < size; i++) {
++      int n = snprintf(out + at, size - at, "%s\n", tu_pipa_notes[i]);
++      if (n > 0)
++         at += (unsigned)n;
++   }
++   pthread_mutex_unlock(&tu_pipa_notes_lock);
++   out[at < size ? at : size - 1] = 0;
++   return at;
++}
++
++/* pipa: a render area at most this many pixels large goes to sysmem (0 = off), read from TU_DEBUG's "pipa_small-<pixels>" token (the boot argument grammar allows no second "="). A
++ * diagnostic switch for the rounded corners of 2026-10-24: the small offscreen pass whose GMEM store is the unaligned 2D path
++ * (64 x 34 in the render server) is the one suspect left that no Turnip debug option reaches. */
++__attribute__((visibility("default"))) unsigned tu_pipa_small_threshold(void)
++{
++   static long value = -1;
++   if (value < 0) {
++      value = 0;
++      const char *debug = os_get_option("TU_DEBUG");
++      const char *at = debug ? strstr(debug, "pipa_small-") : NULL;
++      if (at)
++         value = strtol(at + strlen("pipa_small-"), NULL, 10);
++   }
++   return (unsigned) value;
++}
++
++/* pipa: every image created or imported linear (no tiling, no UBWC), from TU_DEBUG's "pipa_linear" token. Diagnostic: the rounded
++ * corners of 2026-10-24 come out in 4 x 4 pixel blocks in GMEM passes only, and a linear render target tells a layout problem from a
++ * coverage one. */
++__attribute__((visibility("default"))) bool tu_pipa_linear(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_linear") ? 1 : 0;
++   }
++   return value != 0;
++}
++
++/* pipa: render passes that carry input attachments (framebuffer fetch) stay in system memory. In GMEM that read goes through
++ * tu_emit_input_attachments' patched descriptor, and on this board the partially transparent pixels come back in 4 x 4 blocks
++ * (2026-10-25: the rounded corners of the UI, the only edges with alpha, were chamfered; the same pass in system memory is smooth and
++ * its submit-to-retire mean halves, 11.8 ms against 6.7 ms).
++ * TU_DEBUG's "pipa_gmemin" puts such passes back into GMEM for whoever finds the descriptor's fault. 2026-10-25 evening: the four A650
++ * fixes backported that day (uninitialised gmem_offset, tile divisor levels, GRAS_MODE_CNTL, TPL1_DBG_ECO_CNTL) are in and GMEM was
++ * made the default to try them; the corners were still chamfered, so those four are not this bug and the detour is the default again.
++ * Later the same day the patched descriptor was compared field by field with the gmem descriptor of the 3D blit (tu_clear_blit.cc,
++ * r3d_src_gmem), which reads gmem tiles correctly: format, swap, pitch (tile0.width * cpp), tile mode, depth and the cleared ubwc flag
++ * all agree - except TILE_ALL, which that path clears and this one inherited from the image's view. Reading the image's own
++ * descriptor instead ("pipa_iaplain") gives correct corners and every-draw UCHE invalidation ("pipa_iaflush") changes nothing, so the
++ * fetched data is not stale: the tile was being read with the tiled (block interleaved) addressing. tu_emit_input_attachments() now
++ * clears TILE_ALL like the blit does, and "pipa_gmemin" is the switch that puts such passes back into GMEM to check it. */
++__attribute__((visibility("default"))) bool tu_pipa_gmem_input_attachments(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_gmemin") ? 1 : 0;
++   }
++   return value != 0;
++}
++
++/* pipa: TU_DEBUG's "pipa_iaplain" makes tu_emit_input_attachments fall back to the image's own (system memory) descriptor even in a
++ * GMEM pass. Diagnostic. With it the corners are correct row by row (2026-10-25), which proves the fault is on the read side and that
++ * the fault is in what the gmem descriptor makes the hardware read, not in the gmem store.
++ * It is a diagnostic only because it is not safe as a default: it reads the RAM copy, and the driver patches these descriptors
++ * precisely when the RAM copy is stale - see tu_render_pass_patch_input_gmem(): the attachment was cleared in gmem, or written by an
++ * earlier subpass or draw of this pass. A pass that writes and then reads the same attachment would silently read pre-pass content,
++ * which looks smooth and wrong. Passes that read before they write are unaffected, which is why this app renders correctly with it. */
++__attribute__((visibility("default"))) bool tu_pipa_ia_plain(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_iaplain") ? 1 : 0;
++   }
++   return value != 0;
++}
++
++/* pipa: TU_DEBUG's "pipa_iaflush" invalidates UCHE before every draw whose subpass reads a GMEM attachment. It was written for the
++ * theory that the 4 x 4 blocks are stale 64-byte cache lines (a cache line of a cpp 4 attachment is one 4 x 4 pixel block of the
++ * tiled layout); tried on 2026-10-25 it changed nothing at all, so the fetched data is not stale - the address the hardware computes
++ * is wrong, see the TILE_ALL clear in tu_emit_input_attachments(). Kept because it is the cheapest way to re-check that theory if a
++ * future symptom does turn out to be a stale line. */
++__attribute__((visibility("default"))) bool tu_pipa_ia_flush(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_iaflush") ? 1 : 0;
++   }
++   return value != 0;
++}
++
++/* pipa: TU_DEBUG's "pipa_uchegmem" lets Turnip program the UCHE gmem window itself (tu_cmd_buffer.cc, tu6_init_static_regs), which
++ * the kernel normally does and this port does not. Part of the same refuted stale-line theory as tu_pipa_ia_flush(): with
++ * "pipa_iaflush" showing no effect, a missing UCHE window would not explain the blocks either, so this one is only for the record. */
++__attribute__((visibility("default"))) bool tu_pipa_uche_gmem(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_uchegmem") ? 1 : 0;
++   }
++   return value != 0;
++}
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index f73c1f9..7f56862 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -483,4 +483,28 @@ tu_dbg_log_gmem_load_store_skips(struct tu_device *device);
+ #define offsetof_arr(s, field, idx)                                          \
+    (offsetof(s, field) + sizeof_field(s, field[0]) * (idx))
+ 
++/* pipa: render pass notes for the plugin's kernel-log telemetry (tu_util.cc); diagnostic only. */
++#ifdef __cplusplus
++extern "C" {
++#endif
++void tu_pipa_note(const char *text);
++unsigned tu_pipa_note_dump(char *out, unsigned size);
++unsigned tu_pipa_small_threshold(void);
++/* pipa: whether the per-pass text notes are made (TU_DEBUG "pipa_notes"; off by default: they cost a snprintf per render pass on the
++ * render server's thread). */
++bool tu_pipa_notes_enabled(void);
++/* pipa: a slot for one render pass's GPU start and end times (CP_ALWAYS_ON_COUNTER, two 64-bit words at the returned GPU address), by its
++ * area and mode; 0 when there is none. tu_pipa_pass_dump sums the completed slots by shape for the plugin's telemetry. */
++struct tu_device;
++uint64_t tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool sysmem, const char *reason);
++unsigned tu_pipa_pass_dump(char *out, unsigned size);
++bool tu_pipa_linear(void);
++bool tu_pipa_gmem_input_attachments(void);
++bool tu_pipa_ia_plain(void);
++bool tu_pipa_ia_flush(void);
++bool tu_pipa_uche_gmem(void);
++#ifdef __cplusplus
++}
++#endif
++
+ #endif /* TU_UTIL_H */

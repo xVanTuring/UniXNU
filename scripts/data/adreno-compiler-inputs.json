@@ -57,7 +57,9 @@
     "patches/mesa/turnip-gmem-layout-impossible.patch",
     "patches/mesa/turnip-tiling-divisor-linear.patch",
     "patches/mesa/turnip-gras-mode-cntl.patch",
-    "patches/mesa/freedreno-a650-tpl1-eco-cntl.patch"
+    "patches/mesa/freedreno-a650-tpl1-eco-cntl.patch",
+    "patches/mesa/turnip-darwin-bo-cache.patch",
+    "patches/mesa/turnip-pipa-pass-diagnostics.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",

@@ -41,7 +41,10 @@ env['PATH'] = str(ROOT / '.cache/mesa-tools/bin') + ':' + str(ROOT / '.cache/mes
 options = ['-Dgallium-drivers=', '-Dvulkan-drivers=freedreno', '-Dfreedreno-kmds=darwin',
            '-Dtu-darwin-abi-dir=' + str(ROOT / 'drivers/NativeAdreno'), '-Dplatforms=macos', '-Dglx=disabled',
            '-Degl=disabled', '-Dgbm=disabled', '-Dopengl=false', '-Dgles1=disabled', '-Dgles2=disabled',
-           '-Dllvm=disabled', '-Dshared-glapi=disabled', '-Dxmlconfig=disabled', '-Dshader-cache=disabled',
+           # The disk shader cache on: without it every boot compiled each pipeline from NIR again (pipa 2026-10-25: 97 pipeline
+           # makings took 3.9 s, the longest 529 ms, with the render server's frames waiting); the plugin points MESA_SHADER_CACHE_DIR
+           # at its persistent cache directory.
+           '-Dllvm=disabled', '-Dshared-glapi=disabled', '-Dxmlconfig=disabled', '-Dshader-cache=enabled',
            '-Dtools=', '-Dbuild-tests=false', '-Dvideo-codecs=', '-Dvulkan-layers=']
 setup = [ROOT / '.cache/mesa-venv/bin/meson', 'setup', OUT, SOURCE, '--wrap-mode=nodownload']
 if args.target == 'ios':

@@ -1,0 +1,361 @@
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index a8ccd76..2adf180 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -63,6 +63,10 @@ struct tu_bo {
+     * CPU mapping (IOConnectMapMemory64 memory type). */
+    uint64_t darwin_handle;
+    uint32_t darwin_token;
++   /* pipa: made by darwin_bo_init (not an import), so its handle, IOVA and CPU view may be kept for the next BO of its size and
++    * permissions (tu_knl_darwin.cc's BO cache); and the GPU-read-only permission it was mapped with. */
++   bool darwin_reusable : 1;
++   bool darwin_read_only : 1;
+ #endif
+ 
+    bool implicit_sync : 1;
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index b03c6ee..87e6f8d 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -60,6 +60,21 @@ struct darwin_retired_bo {
+    uint64_t handle, iova, size;
+    void *mapping;
+    uint32_t token, fence;
++   bool keep, read_only;   /* may go to the BO cache once its fence completed */
++};
++/* pipa: BOs whose fence completed kept whole (kernel handle, GPU mapping at their IOVA, CPU view) for the next allocation of the same size
++ * and permission. On the tablet a BO's life is six or seven kernel calls (BoAlloc, BoMap, BoCpuMap, IOConnectMapMemory64, then the
++ * unmap, BoCpuUnmap and BoFree) of about 1 to 4 ms each (2026-10-25, tu_pipa_knl_dump), and the command streams of every recorded
++ * command buffer grew into new BOs and gave them back at the pool reset: some 4 ms of the render thread's frame. A reused BO is zeroed
++ * through its CPU view as the kernel zeroes a new one, except a command stream's (written before the GPU reads any of it). */
++enum { DARWIN_CACHED_BOS = 128 };
++#define DARWIN_CACHE_BYTES (48ull << 20)
++#define DARWIN_CACHE_LARGEST (8ull << 20)
++struct darwin_cached_bo {
++   uint64_t handle, iova, size;
++   void *mapping;
++   uint32_t token;
++   bool read_only;
+ };
+ struct darwin_retire_state {
+    pthread_mutex_t lock;
+@@ -67,11 +82,109 @@ struct darwin_retire_state {
+    unsigned head, count;
+    VkResult failure;
+    uint64_t enqueued, reaped, pressure_waits;
++   struct darwin_cached_bo cached[DARWIN_CACHED_BOS];   /* oldest first */
++   unsigned cached_count;
++   uint64_t cached_bytes, cache_hits, cache_misses, cache_evictions;
+ };
+ 
++/* pipa: what the kernel calls cost (2026-10-25: the render server's render thread spent 21% of its CPU inside IOConnectCallStructMethod,
++ * 7.7% of it under tu_bo_init_new), per ABI method (1..16; 20 the CPU view's IOConnectMapMemory64, 21 its unmap) and per BO name at
++ * allocation, for the plugin's telemetry (tu_pipa_knl_dump, read with dlsym). Counting only. */
++struct dw_stat {
++   uint64_t count, ns;
++};
++static struct dw_stat dw_method_stats[24];
++struct dw_name_stat {
++   const char *name;
++   uint64_t count, bytes, ns;
++};
++static struct dw_name_stat dw_name_stats[12];
++static uint64_t dw_free_count, dw_free_bytes;
++/* The BO cache's hits, misses, evictions, entries and bytes, copied from the device's retire state at each change (tu_pipa_knl_dump). */
++static volatile uint64_t dw_cache_stats[5];
++static pthread_mutex_t dw_stats_lock = PTHREAD_MUTEX_INITIALIZER;
++static void
++dw_note_method(uint32_t method, uint64_t began)
++{
++   const uint64_t took = os_time_get_nano() - began;
++   pthread_mutex_lock(&dw_stats_lock);
++   struct dw_stat *s = &dw_method_stats[method < ARRAY_SIZE(dw_method_stats) ? method : 0];
++   s->count++;
++   s->ns += took;
++   pthread_mutex_unlock(&dw_stats_lock);
++}
++static void
++dw_note_bo(const char *name, uint64_t bytes, uint64_t began)
++{
++   const uint64_t took = os_time_get_nano() - began;
++   if (!name)
++      name = "?";
++   pthread_mutex_lock(&dw_stats_lock);
++   unsigned i = 0;
++   for (; i < ARRAY_SIZE(dw_name_stats) - 1; i++)
++      if (!dw_name_stats[i].name || !strcmp(dw_name_stats[i].name, name))
++         break;
++   if (!dw_name_stats[i].name)
++      dw_name_stats[i].name = i == ARRAY_SIZE(dw_name_stats) - 1 ? "other" : name;
++   dw_name_stats[i].count++;
++   dw_name_stats[i].bytes += bytes;
++   dw_name_stats[i].ns += took;
++   pthread_mutex_unlock(&dw_stats_lock);
++}
++extern "C" unsigned tu_pipa_knl_dump(char *out, unsigned size);
++extern "C" __attribute__((visibility("default"))) unsigned
++tu_pipa_knl_dump(char *out, unsigned size)
++{
++   static const char *const names[24] = {"?", "query", "alloc", "map", "free", "submit", "wait", "ts", "status", "setmd", "getmd",
++                                         "mkq", "closeq", "cpumap", "cpuunmap", "info", "import", "", "", "", "iomap", "iounmap"};
++   unsigned at = 0;
++   pthread_mutex_lock(&dw_stats_lock);
++   int n = snprintf(out, size, "KM");
++   at = n > 0 ? (unsigned)n : 0;
++   for (unsigned m = 1; m < ARRAY_SIZE(dw_method_stats) && at + 40 < size; m++) {
++      if (!dw_method_stats[m].count)
++         continue;
++      n = snprintf(out + at, size - at, " %s %llu/%llums", names[m], (unsigned long long)dw_method_stats[m].count,
++                   (unsigned long long)(dw_method_stats[m].ns / 1000000));
++      if (n > 0)
++         at += (unsigned)n;
++   }
++   n = snprintf(out + at, size - at, " | freed %llu %lluMB | cache hit %llu miss %llu evict %llu now %u/%lluKB\n",
++                (unsigned long long)dw_free_count, (unsigned long long)(dw_free_bytes >> 20),
++                (unsigned long long)dw_cache_stats[0], (unsigned long long)dw_cache_stats[1], (unsigned long long)dw_cache_stats[2],
++                (unsigned)dw_cache_stats[3], (unsigned long long)(dw_cache_stats[4] >> 10));
++   if (n > 0)
++      at += (unsigned)n;
++   for (unsigned i = 0; i < ARRAY_SIZE(dw_name_stats) && dw_name_stats[i].name && at + 60 < size; i++) {
++      n = snprintf(out + at, size - at, "KB %.24s n%llu %lluKB %llums\n", dw_name_stats[i].name,
++                   (unsigned long long)dw_name_stats[i].count, (unsigned long long)(dw_name_stats[i].bytes >> 10),
++                   (unsigned long long)(dw_name_stats[i].ns / 1000000));
++      if (n > 0)
++         at += (unsigned)n;
++   }
++   pthread_mutex_unlock(&dw_stats_lock);
++   if (at >= size)
++      at = size - 1;
++   out[at] = 0;
++   return at;
++}
++
++static kern_return_t
++dw_call_raw(uint32_t method, const void *in, size_t in_size, void *out,
++            size_t out_size);
+ static kern_return_t
+ dw_call(uint32_t method, const void *in, size_t in_size, void *out,
+         size_t out_size)
++{
++   const uint64_t began = os_time_get_nano();
++   kern_return_t kr = dw_call_raw(method, in, in_size, out, out_size);
++   dw_note_method(method, began);
++   return kr;
++}
++
++static kern_return_t
++dw_call_raw(uint32_t method, const void *in, size_t in_size, void *out,
++            size_t out_size)
+ {
+    size_t out_bytes = out_size;
+    if (!dw.tunnel)
+@@ -259,6 +372,85 @@ darwin_free_iova(struct tu_device *dev, uint64_t iova, uint64_t size)
+    mtx_unlock(&dev->vma_mutex);
+ }
+ 
++static void
++darwin_cache_publish(const struct darwin_retire_state *retire)
++{
++   dw_cache_stats[0] = retire->cache_hits;
++   dw_cache_stats[1] = retire->cache_misses;
++   dw_cache_stats[2] = retire->cache_evictions;
++   dw_cache_stats[3] = retire->cached_count;
++   dw_cache_stats[4] = retire->cached_bytes;
++}
++
++/* pipa BO cache: releases a cached BO to the kernel (an eviction), under retire->lock. */
++static VkResult
++darwin_release_cached(struct tu_device *dev, struct darwin_retire_state *retire, const struct darwin_cached_bo *c)
++{
++   const uint64_t unmap_began = os_time_get_nano();
++   kern_return_t kr = IOConnectUnmapMemory64(dw.conn, c->token, mach_task_self(), (mach_vm_address_t)(uintptr_t)c->mapping);
++   dw_note_method(21, unmap_began);
++   if (kr != KERN_SUCCESS)
++      return retire->failure = vk_device_set_lost(&dev->vk, "cached BO CPU unmap failed: 0x%x", kr);
++   NativeAdrenoAbiBoCpuUnmap undo = {.handle = c->handle, .token = c->token};
++   kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
++   if (kr != KERN_SUCCESS)
++      return retire->failure = vk_device_set_lost(&dev->vk, "cached BO CPU lease release failed: 0x%x", kr);
++   NativeAdrenoAbiBoFree release = {.handle = c->handle};
++   kr = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
++   if (kr != KERN_SUCCESS)
++      return retire->failure = vk_device_set_lost(&dev->vk, "cached BoFree failed: 0x%x", kr);
++   darwin_free_iova(dev, c->iova, c->size);
++   return VK_SUCCESS;
++}
++
++/* pipa BO cache: keeps a retired BO whose fence completed, evicting the oldest ones past the cache's bounds. False leaves it to the
++ * ordinary release (too large, or an eviction failed). Under retire->lock. */
++static bool
++darwin_cache_keep(struct tu_device *dev, struct darwin_retire_state *retire, const struct darwin_retired_bo *bo)
++{
++   if (bo->size > DARWIN_CACHE_LARGEST)
++      return false;
++   while (retire->cached_count && (retire->cached_count == DARWIN_CACHED_BOS ||
++                                   retire->cached_bytes + bo->size > DARWIN_CACHE_BYTES)) {
++      struct darwin_cached_bo oldest = retire->cached[0];
++      memmove(&retire->cached[0], &retire->cached[1], (retire->cached_count - 1) * sizeof(retire->cached[0]));
++      --retire->cached_count;
++      retire->cached_bytes -= oldest.size;
++      ++retire->cache_evictions;
++      if (darwin_release_cached(dev, retire, &oldest) != VK_SUCCESS) {
++         darwin_cache_publish(retire);
++         return false;
++      }
++   }
++   retire->cached[retire->cached_count++] = {bo->handle, bo->iova, bo->size, bo->mapping, bo->token, bo->read_only};
++   retire->cached_bytes += bo->size;
++   darwin_cache_publish(retire);
++   return true;
++}
++
++/* pipa BO cache: the newest cached BO of exactly `size` bytes and the permission asked for, taken out of the cache; false if none. */
++static bool
++darwin_cache_take(struct darwin_retire_state *retire, uint64_t size, bool read_only, struct darwin_cached_bo *out)
++{
++   pthread_mutex_lock(&retire->lock);
++   for (unsigned i = retire->cached_count; i-- > 0;) {
++      if (retire->cached[i].size != size || retire->cached[i].read_only != read_only)
++         continue;
++      *out = retire->cached[i];
++      memmove(&retire->cached[i], &retire->cached[i + 1], (retire->cached_count - 1 - i) * sizeof(retire->cached[0]));
++      --retire->cached_count;
++      retire->cached_bytes -= size;
++      ++retire->cache_hits;
++      darwin_cache_publish(retire);
++      pthread_mutex_unlock(&retire->lock);
++      return true;
++   }
++   ++retire->cache_misses;
++   darwin_cache_publish(retire);
++   pthread_mutex_unlock(&retire->lock);
++   return false;
++}
++
+ /* Called under retire->lock. All fence polls are nonblocking. Failed/uncertain
+  * releases retain the record and the IOVA; a busy BO is retried by a later sweep. */
+ static VkResult
+@@ -281,10 +473,19 @@ darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire)
+          have_completed_fence = true;
+          completed_fence = bo->fence;
+       }
++      if (bo->keep && bo->mapping && bo->token && darwin_cache_keep(dev, retire, bo)) {
++         *bo = {};
++         retire->head = (retire->head + 1) % DARWIN_RETIRED_BOS;
++         --retire->count;
++         ++retire->reaped;
++         continue;
++      }
+       if (bo->token) {
+          if (bo->mapping) {
++            const uint64_t unmap_began = os_time_get_nano();
+             kern_return_t kr = IOConnectUnmapMemory64(dw.conn, bo->token, mach_task_self(),
+                                                      (mach_vm_address_t)(uintptr_t)bo->mapping);
++            dw_note_method(21, unmap_began);
+             if (kr != KERN_SUCCESS)
+                return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU unmap failed: 0x%x", kr);
+             bo->mapping = NULL;
+@@ -353,10 +554,62 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+    if (lazy_vma)
+       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+ 
++   const uint64_t init_began = os_time_get_nano();
++   const char *asked_name = name;   /* tu_debug_bos_add below returns NULL unless TU_DEBUG=bos */
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
+       return collected;
+ 
++   const bool read_only = !!(flags & TU_BO_ALLOC_GPU_READ_ONLY);
++   const bool reusable = !client_iova && !(flags & (TU_BO_ALLOC_REPLAYABLE | TU_BO_ALLOC_DMABUF | TU_BO_ALLOC_SHAREABLE));
++   /* A reusable BO is made a little larger, to the next of eight steps per power of two (16 KiB steps below 128 KiB), so that the BOs of
++    * textures and buffers of about the same size meet in the cache (2026-10-25: 228 hits of 1400 at exact sizes while apps opened). At
++    * most an eighth more memory; every user of the BO reads its size from the BO. */
++   if (reusable && size > 16384) {
++      const uint64_t step = size <= (128u << 10) ? 16384 : (1ull << (util_logbase2_64(size - 1) - 3));
++      size = align64(size, step);
++   }
++   static int cache_off = -1;
++   if (cache_off < 0)
++      cache_off = debug_get_bool_option("TU_DARWIN_NO_BO_CACHE", false);
++   struct darwin_cached_bo reuse;
++   if (reusable && !cache_off && darwin_cache_take((struct darwin_retire_state *)dev->darwin_retire, size, read_only, &reuse)) {
++      /* A command stream is written before the GPU reads any of it; everything else starts as zeros, as the kernel's new BOs do. */
++      const size_t named = asked_name ? strlen(asked_name) : 0;
++      if (!(named >= 3 && !strcmp(asked_name + named - 3, " cs")))
++         memset(reuse.mapping, 0, size);
++      uint32_t gem_handle = (uint32_t)reuse.handle;
++      struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
++      assert(bo && bo->gem_handle == 0);
++      name = tu_debug_bos_add(dev, size, name);
++      *bo = (struct tu_bo) {
++         .gem_handle = gem_handle,
++         .size = size,
++         .iova = reuse.iova,
++         .map = reuse.mapping,
++         .name = name,
++         .refcnt = 1,
++         .implicit_sync = !!(flags & TU_BO_ALLOC_IMPLICIT_SYNC),
++         .base = base,
++         .unique_id = reuse.handle,
++      };
++      bo->darwin_handle = reuse.handle;
++      bo->darwin_token = reuse.token;
++      bo->never_unmap = true;
++      bo->darwin_reusable = true;
++      bo->darwin_read_only = read_only;
++      dw_note_bo(asked_name, size, init_began);
++      tu_dump_bo_init(dev, bo);
++      TU_RMV(bo_allocate, dev, bo);
++      TU_RMV(bo_map, dev, bo);
++      *out_bo = bo;
++      if (flags & TU_BO_ALLOC_INTERNAL_RESOURCE) {
++         TU_RMV(internal_resource_create, dev, bo);
++         TU_RMV(resource_name, dev, bo, name);
++      }
++      return VK_SUCCESS;
++   }
++
+    uint64_t iova;
+    VkResult result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
+    if (result != VK_SUCCESS)
+@@ -400,6 +653,9 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       .unique_id = reply.handle,
+    };
+    bo->darwin_handle = reply.handle;
++   bo->darwin_reusable = reusable;
++   bo->darwin_read_only = read_only;
++   dw_note_bo(asked_name, size, init_began);
+ 
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
+@@ -491,7 +747,9 @@ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+     * kIOMapAnywhere would give a cached mapping of memory the GPU reads non-cacheable. Write combine is Normal non-cacheable: the
+     * GPU sees CPU writes after a barrier, and memcpy/unaligned stores stay legal (device-memory mappings fault on those). */
+    uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | kIOMapWriteCombineCache;
++   const uint64_t map_began = os_time_get_nano();
+    kr = IOConnectMapMemory64(dw.conn, reply.token, mach_task_self(), &address, &length, options);
++   dw_note_method(20, map_began);
+    if (kr != KERN_SUCCESS || !address || length < bo->size) {
+       NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->darwin_handle, .token = reply.token};
+       dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
+@@ -562,6 +820,10 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    tu_debug_bos_del(dev, bo);
+    tu_dump_bo_del(dev, bo);
++   pthread_mutex_lock(&dw_stats_lock);
++   dw_free_count++;
++   dw_free_bytes += bo->size;
++   pthread_mutex_unlock(&dw_stats_lock);
+ 
+    if (bo->map && bo->darwin_token)
+       TU_RMV(bo_unmap, dev, bo);
+@@ -585,7 +847,8 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       uint32_t fence = dw.last_fence;
+       pthread_mutex_unlock(&dw.lock);
+       unsigned slot = (retire->head + retire->count) % DARWIN_RETIRED_BOS;
+-      retire->entries[slot] = {bo->darwin_handle, bo->iova, bo->size, bo->map, bo->darwin_token, fence};
++      retire->entries[slot] = {bo->darwin_handle, bo->iova, bo->size, bo->map, bo->darwin_token, fence,
++                               bo->darwin_reusable && bo->map && bo->darwin_token, bo->darwin_read_only};
+       ++retire->count;
+       ++retire->enqueued;
+       darwin_reap_locked(dev, retire);
