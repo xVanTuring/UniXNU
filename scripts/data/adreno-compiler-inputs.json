@@ -59,7 +59,8 @@
     "patches/mesa/turnip-gras-mode-cntl.patch",
     "patches/mesa/freedreno-a650-tpl1-eco-cntl.patch",
     "patches/mesa/turnip-darwin-bo-cache.patch",
-    "patches/mesa/turnip-pipa-pass-diagnostics.patch"
+    "patches/mesa/turnip-pipa-pass-diagnostics.patch",
+    "patches/mesa/turnip-pipa-feedback-loop.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",

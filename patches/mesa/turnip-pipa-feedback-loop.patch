@@ -1,0 +1,204 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index afdbfb1..87d4be3 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1421,7 +1421,10 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+     * (2026-10-25: the rounded corners of the UI, the only edges with alpha, were chamfered; the same pass in system memory is smooth and
+     * its submit-to-retire mean halves, 11.8 ms against 6.7 ms). TU_DEBUG's "pipa_gmemin" puts such passes back into GMEM for whoever
+     * finds the descriptor's fault. */
+-   if (cmd->state.pass && !tu_pipa_gmem_input_attachments() && cmd->state.pass->subpasses[0].input_count > 0) {
++   /* TU_DEBUG's "pipa_gmemplain" lets the passes whose draws read no input attachment (rp.pipa_reads_inputs) take GMEM all the same:
++    * no draw of such a pass reads the input attachment descriptor the corners came out of. */
++   if (cmd->state.pass && !tu_pipa_gmem_input_attachments() && cmd->state.pass->subpasses[0].input_count > 0 &&
++       (!tu_pipa_gmem_plain() || cmd->state.rp.pipa_reads_inputs)) {
+       cmd->state.rp.gmem_disable_reason = "pipa: input attachments";
+       return true;
+    }
+@@ -4111,6 +4114,7 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+    /* pipa: the pass's GPU time (tu_pipa_pass_slot): the always-on counter before it, and after a WFI at its end. */
+    const uint64_t pipa_times = tu_pipa_pass_slot(cmd_buffer->device, cmd_buffer->state.render_areas[0].extent.width,
+                                                  cmd_buffer->state.render_areas[0].extent.height, use_sysmem,
++                                                 cmd_buffer->state.rp.pipa_reads_inputs,
+                                                  cmd_buffer->state.rp.gmem_disable_reason);
+    if (pipa_times) {
+       tu_cs_emit_pkt7(&cmd_buffer->cs, CP_REG_TO_MEM, 3);
+@@ -5592,6 +5596,10 @@ tu_pipeline_update_rp_state(struct tu_cmd_state *cmd_state)
+          "VK_EXT_attachment_feedback_loop_layout may involve textures";
+    }
+ 
++   if (cmd_state->shaders[MESA_SHADER_FRAGMENT] &&
++       cmd_state->shaders[MESA_SHADER_FRAGMENT]->fs.pipa_reads_input_attachments)
++      cmd_state->rp.pipa_reads_inputs = true;
++
+    if (cmd_state->pipeline_sysmem_single_prim_mode &&
+        !cmd_state->rp.sysmem_single_prim_mode) {
+       perf_debug(cmd->device, "single_prim_mode due to pipeline settings");
+@@ -6299,6 +6307,7 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
+    dst->has_zpass_done_sample_count_write_in_rp |= src->has_zpass_done_sample_count_write_in_rp;
+    dst->disable_gmem |= src->disable_gmem;
+    dst->sysmem_single_prim_mode |= src->sysmem_single_prim_mode;
++   dst->pipa_reads_inputs |= src->pipa_reads_inputs;
+    dst->draw_cs_writes_to_cond_pred |= src->draw_cs_writes_to_cond_pred;
+    dst->shared_viewport |= src->shared_viewport;
+ 
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 17bebeb..cd19a6a 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -314,6 +314,8 @@ struct tu_render_pass_state
+    bool has_zpass_done_sample_count_write_in_rp;
+    bool disable_gmem;
+    bool sysmem_single_prim_mode;
++   /* pipa: a draw of the pass ran a fragment shader that reads an input attachment (tu_shader fs.pipa_reads_input_attachments). */
++   bool pipa_reads_inputs;
+ 
+    /* This is set if, at any point in the render pass, we were not able to
+     * duplicate the viewport per-view due to the user using multiple viewports
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 8b010ed..5dace94 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3776,6 +3776,15 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+     */
+    raster_order_attachment_access |= TU_DEBUG(RAST_ORDER);
+ 
++   /* pipa: a subpass that reads its colors back as input attachments is a feedback loop (tu_render_pass_check_feedback_loop), and
++    * that puts every pipeline made for it in FLUSH_PER_OVERLAP_AND_OVERWRITE below; metal2vulkan makes every color pass so on this
++    * device (framebuffer_fetch.rs: a pass cannot foresee which of its draws fetch), and passes with input attachments stay in
++    * system memory here (use_sysmem_rendering, "pipa: input attachments"). TU_DEBUG's "pipa_fbloop" leaves the mode to the
++    * pipelines whose fragment shader reads an input attachment. Off by default: 2026-10-25 it took 10 % off a full-screen pass
++    * (2.03 against 1.83 ms), and the App Library's folder backgrounds came out with a colour shift and a jagged diagonal. */
++   if (tu_pipa_feedback_loop_relaxed() && !fs->fs.pipa_reads_input_attachments)
++      feedback_loops = 0;
++
+    /* If there is a feedback loop, then the shader can read the previous value
+     * of a pixel being written out. It can also write some components and then
+     * read different components without a barrier in between. This is a
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index d99d55c..581176f 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -560,6 +560,8 @@ build_bindless(struct tu_device *dev, nir_builder *b,
+       /* Record which input attachments are used for tracking feedback loops */
+       if (dynamic_renderpass)
+          shader->fs.dynamic_input_attachments_used |= (1u << (idx / 2));
++      if (b->shader->info.stage == MESA_SHADER_FRAGMENT)
++         shader->fs.pipa_reads_input_attachments = true;
+ 
+       BITSET_SET_RANGE_INSIDE_WORD(b->shader->info.textures_used, idx, (idx + bind_layout->array_size * 2) - 1);
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 1cd0e89..e3ddb19 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -108,6 +108,9 @@ struct tu_shader
+ 
+          uint16_t dynamic_input_attachments_used;
+ 
++         /* pipa: the shader reads an input attachment (build_bindless), whatever the render pass kind; tu6_emit_prim_mode_sysmem. */
++         bool pipa_reads_input_attachments;
++
+          struct {
+             uint32_t status;
+             bool force_late_z;
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index a1e2fa5..a95ffa1 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -684,7 +684,7 @@ tu_pipa_notes_enabled(void)
+ #define PIPA_TS_SHAPES 24
+ struct pipa_ts_shape {
+    uint32_t width, height;
+-   bool sysmem;
++   bool sysmem, reads;   /* reads: a draw of the pass read an input attachment (rp.pipa_reads_inputs) */
+    uint64_t count, ticks, longest;
+    const char *reason;   /* why the last such pass went to system memory (gmem_disable_reason) */
+ };
+@@ -697,7 +697,7 @@ static uint32_t pipa_ts_next;
+ static pthread_mutex_t pipa_ts_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ uint64_t
+-tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool sysmem, const char *reason)
++tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool sysmem, bool reads, const char *reason)
+ {
+    pthread_mutex_lock(&pipa_ts_lock);
+    if (!pipa_ts_bo && !pipa_ts_device) {
+@@ -717,11 +717,12 @@ tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool s
+    }
+    unsigned shape = 0;
+    for (; shape < pipa_ts_shape_count; shape++)
+-      if (pipa_ts_shapes[shape].width == width && pipa_ts_shapes[shape].height == height && pipa_ts_shapes[shape].sysmem == sysmem)
++      if (pipa_ts_shapes[shape].width == width && pipa_ts_shapes[shape].height == height && pipa_ts_shapes[shape].sysmem == sysmem &&
++          pipa_ts_shapes[shape].reads == reads)
+          break;
+    if (shape == pipa_ts_shape_count) {
+       if (pipa_ts_shape_count < PIPA_TS_SHAPES - 1) {
+-         pipa_ts_shapes[shape] = (struct pipa_ts_shape) {width, height, sysmem, 0, 0, 0, NULL};
++         pipa_ts_shapes[shape] = (struct pipa_ts_shape) {width, height, sysmem, reads, 0, 0, 0, NULL};
+          pipa_ts_shape_count++;
+       } else {
+          shape = PIPA_TS_SHAPES - 1;   /* the rest together */
+@@ -769,8 +770,9 @@ tu_pipa_pass_dump(char *out, unsigned size)
+             break;
+          shown[best] = true;
+          const struct pipa_ts_shape *shape = &pipa_ts_shapes[best];
+-         int n = snprintf(out + at, size - at, "PT %ux%u %s n%llu %llums mean %lluus max %lluus %.24s\n", shape->width, shape->height,
+-                          best == PIPA_TS_SHAPES - 1 ? "other" : shape->sysmem ? "sys" : "gmem", (unsigned long long) shape->count,
++         int n = snprintf(out + at, size - at, "PT %ux%u %s%s n%llu %llums mean %lluus max %lluus %.24s\n", shape->width, shape->height,
++                          best == PIPA_TS_SHAPES - 1 ? "other" : shape->sysmem ? "sys" : "gmem",
++                          best != PIPA_TS_SHAPES - 1 && shape->reads ? "+in" : "", (unsigned long long) shape->count,
+                           (unsigned long long) (shape->ticks / 19200), (unsigned long long) (shape->ticks * 10 / 192 / shape->count),
+                           (unsigned long long) (shape->longest * 10 / 192),
+                           shape->sysmem && shape->reason ? shape->reason : "");
+@@ -849,6 +851,29 @@ __attribute__((visibility("default"))) bool tu_pipa_gmem_input_attachments(void)
+    return value != 0;
+ }
+ 
++/* pipa: TU_DEBUG's "pipa_fbloop": in a feedback loop subpass in system memory only the pipelines whose fragment shader reads an input
++ * attachment take the single primitive mode (tu6_emit_prim_mode_sysmem); without it every pipeline does, as upstream. */
++__attribute__((visibility("default"))) bool tu_pipa_feedback_loop_relaxed(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_fbloop") ? 1 : 0;
++   }
++   return value != 0;
++}
++
++/* pipa: TU_DEBUG's "pipa_gmemplain": a pass with input attachments whose draws never fetch may render in GMEM (use_sysmem_rendering). */
++__attribute__((visibility("default"))) bool tu_pipa_gmem_plain(void)
++{
++   static int value = -1;
++   if (value < 0) {
++      const char *debug = os_get_option("TU_DEBUG");
++      value = debug && strstr(debug, "pipa_gmemplain") ? 1 : 0;
++   }
++   return value != 0;
++}
++
+ /* pipa: TU_DEBUG's "pipa_iaplain" makes tu_emit_input_attachments fall back to the image's own (system memory) descriptor even in a
+  * GMEM pass. Diagnostic. With it the corners are correct row by row (2026-10-25), which proves the fault is on the read side and that
+  * the fault is in what the gmem descriptor makes the hardware read, not in the gmem store.
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index 7f56862..e9afb11 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -494,12 +494,15 @@ unsigned tu_pipa_small_threshold(void);
+  * render server's thread). */
+ bool tu_pipa_notes_enabled(void);
+ /* pipa: a slot for one render pass's GPU start and end times (CP_ALWAYS_ON_COUNTER, two 64-bit words at the returned GPU address), by its
+- * area and mode; 0 when there is none. tu_pipa_pass_dump sums the completed slots by shape for the plugin's telemetry. */
++ * area, mode and whether a draw read an input attachment; 0 when there is none. tu_pipa_pass_dump sums the completed slots by shape for the plugin's telemetry. */
+ struct tu_device;
+-uint64_t tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool sysmem, const char *reason);
++uint64_t tu_pipa_pass_slot(struct tu_device *dev, uint32_t width, uint32_t height, bool sysmem, bool reads,
++                           const char *reason);
+ unsigned tu_pipa_pass_dump(char *out, unsigned size);
+ bool tu_pipa_linear(void);
+ bool tu_pipa_gmem_input_attachments(void);
++bool tu_pipa_feedback_loop_relaxed(void);
++bool tu_pipa_gmem_plain(void);
+ bool tu_pipa_ia_plain(void);
+ bool tu_pipa_ia_flush(void);
+ bool tu_pipa_uche_gmem(void);
