@@ -569,3 +569,20 @@ mdss: CTL0 layer 01000005 01000028 flush 00000000 intf 00000006 pipe 00000000
 建议顺序（都在那份文件 §5.3）：先摘 Turnip 的一行级修复（`GRAS_MODE_CNTL`、A650
 `TPL1_DBG_ECO_CNTL`），再摘 GMEM 规划两条并打开 `pipa_gmemin` 验圆角；metal2vulkan 单独排期，
 动之前先确认"全影子"不会把 5 ms/pass 还回来。
+
+## 14. WiFi（QCA6390 on PCIe0）前期调研（2026-10-25，只读）
+
+见 **[HANDOFF-pipa-wifi.md](HANDOFF-pipa-wifi.md)**。只做了调研，没有代码、没有动 `board.toml`。
+四个要点：
+
+- 硬件是 QCA6390 挂 PCIe RC0，但本仓库**没有 PCIe 主机控制器驱动**，ADT 里只有 `intc`+`ufshc`；
+  要补 DWC host + QMP PHY（`qcom,phy-sequence` 已在 DTS 里，99 组）+ GCC 时钟/复位/GDSC + PERST#。
+- 第一道真门槛是**供电**：WLAN 四路（pm8150 s6 供 aon+dig、s4、s5，pm8150a s8）和 PCIe 三路（l9/l5/CX）
+  全是 **RPMh** 稳压器，而仓库里没有 RPMh 驱动。要么用已有的 SPMI 通道直写 PMIC（临时），
+  要么补一个最小 RSC/TCS 驱动（1–2 周）——这是整条链路里最不确定的一环。
+- **这台 iPadOS 17.7.11 没有内核态 IO80211**：`kernelcache` 的 kext 清单里 WiFi 只剩 20 KB 的
+  `AppleOLYHAL`，WiFi 驱动是系统卷上的 DriverKit dext `com.apple.DriverKit-AppleBCMWLAN.dext`
+  （Broadcom 专用），80211 控制面是它的 `IO80211APIUserClient`。所以"加载原生 IO80211 栈"不存在，
+  要让 UI 显示 WiFi 只能自己实现 `IO80211.framework` 的 user client ABI（兄弟项目 giulia 在 iOS 16 上做过）。
+- 有可直接借的先例：`tycykp/UniXNU-OnePlus-Ace5` 的 `ios16/wifi/`（PCIe/SMMU/MHI/QMI/DP/RSN + Apple ABI）。
+  估量：扫到 AP 约 2–3 个月，能上网再 2 个月，UI 显示再加 1–2 个月；细节和判据在那份文件 §4/§5。
